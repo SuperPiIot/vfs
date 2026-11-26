@@ -1,0 +1,6 @@
+chunks,group_size,streams,rtt_ms,base_dur,grouped_dur,speedup,reduction
+256,8,16,0,145ms,130ms,1.12,8.00
+256,8,16,2,380ms,165ms,2.30,8.00
+256,8,16,5,890ms,280ms,3.18,8.00
+256,8,16,10,1820ms,490ms,3.71,8.00
+256,8,16,20,3540ms,890ms,3.98,8.00
