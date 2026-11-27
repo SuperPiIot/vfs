@@ -9,8 +9,10 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -25,7 +27,8 @@ import (
 )
 
 // ProbeBackend wraps a backend.Backend to count every real object-store call
-// and optionally inject an explicitly labeled simulated per-request delay.
+// and physical bytes written/deleted on canonical pack/ and meta/ objects,
+// plus optional explicitly labeled simulated per-request delay.
 type ProbeBackend struct {
 	backend.Backend
 	SimDelay time.Duration
@@ -37,6 +40,10 @@ type ProbeBackend struct {
 	PutVers    atomic.Int64
 	Deletes    atomic.Int64
 	Stats      atomic.Int64
+
+	PackPuts         atomic.Int64
+	PackBytesWritten atomic.Int64
+	PackDeletes      atomic.Int64
 }
 
 // NewProbeBackend wraps be with real request counting and optional simulated delay.
@@ -65,12 +72,20 @@ func (p *ProbeBackend) GetRange(ctx context.Context, key string, off, n int64) (
 func (p *ProbeBackend) Put(ctx context.Context, key string, data []byte) error {
 	p.delay()
 	p.Puts.Add(1)
+	if strings.HasPrefix(key, "pack/") {
+		p.PackPuts.Add(1)
+		p.PackBytesWritten.Add(int64(len(data)))
+	}
 	return p.Backend.Put(ctx, key, data)
 }
 
 func (p *ProbeBackend) PutIfAbsent(ctx context.Context, key string, data []byte) (backend.Version, error) {
 	p.delay()
 	p.PutAbsents.Add(1)
+	if strings.HasPrefix(key, "pack/") {
+		p.PackPuts.Add(1)
+		p.PackBytesWritten.Add(int64(len(data)))
+	}
 	return p.Backend.PutIfAbsent(ctx, key, data)
 }
 
@@ -83,6 +98,9 @@ func (p *ProbeBackend) PutIfVersion(ctx context.Context, key string, data []byte
 func (p *ProbeBackend) Delete(ctx context.Context, key string) error {
 	p.delay()
 	p.Deletes.Add(1)
+	if strings.HasPrefix(key, "pack/") {
+		p.PackDeletes.Add(1)
+	}
 	return p.Backend.Delete(ctx, key)
 }
 
@@ -99,7 +117,7 @@ func (p *ProbeBackend) TotalRequests() int64 {
 }
 
 // TraceOp represents a single deterministic operation in a synthetic coding-agent
-// build and workspace trace.
+// build and workspace trace executed against a canonical vfs.Volume.
 type TraceOp struct {
 	Round        int
 	Kind         string // "put", "delete", "checkpoint", "compact"
@@ -111,7 +129,7 @@ type TraceOp struct {
 }
 
 // AgentTrace holds a chronologically split 40% training / 60% held-out workload
-// plus a 100%-long-lived zero-expiration negative control trace.
+// plus a zero-expiration negative control trace.
 type AgentTrace struct {
 	TrainRecords      []TrainingRecord
 	HeldOutRecords    []TrainingRecord
@@ -121,19 +139,18 @@ type AgentTrace struct {
 }
 
 // GenerateAgentTrace constructs a deterministic coding-agent build + workspace
-// workload split chronologically 40% train / 60% held-out. The held-out split
-// uses disjoint workspace prefixes, unseen file names, overlapping extensions
-// (such as .bin and .log), and organic ~4% TTL variance so the learned
-// classifier must generalize without memorization or oracle cheating.
+// workload split chronologically 40% train / 60% held-out. Every file size is
+// above vfs's 16 KiB inline threshold so all files go through the canonical
+// FastCDC chunker and pack builder (`pack/<2hex>/<128-bit-random-id>`).
 func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize int) AgentTrace {
 	if totalRounds < 5 {
 		totalRounds = 10
 	}
-	if filesPerRound < 10 {
-		filesPerRound = 30
+	if filesPerRound < 8 {
+		filesPerRound = 16
 	}
-	if avgChunkSize < 1024 {
-		avgChunkSize = 16 << 10
+	if avgChunkSize < 20<<10 {
+		avgChunkSize = 24 << 10
 	}
 	trainRounds := max(2, (totalRounds*4)/10)
 	rng := rand.New(rand.NewPCG(seed, seed^0x517cc1b727220a95))
@@ -149,7 +166,6 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 		oracleTruth = make(map[string]Lifetime)
 	)
 
-	// Scheduled deletions by round for held-out simulation.
 	expireAt := make(map[int][]string)
 	fileSeq := 0
 
@@ -174,7 +190,7 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 			cls = LifetimeEphemeral
 			ttl = time.Duration(30+rng.IntN(90)) * time.Second
 			sub := seq % 4
-			sz = avgChunkSize/2 + rng.IntN(avgChunkSize)
+			sz = max(18<<10, (avgChunkSize*3)/4+rng.IntN(avgChunkSize/2))
 			switch sub {
 			case 0:
 				key = fmt.Sprintf("/%s/target/debug/deps/crate_%04d.o", ws, seq)
@@ -189,7 +205,6 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 				key = fmt.Sprintf("/%s/tmp/scratch/run_%04d.log", ws, seq)
 				meta = ObjectMeta{Path: key, Size: int64(sz), OverwriteRate: 0.75 + rng.Float64()*0.20, ProcessTag: "agent"}
 			}
-			// 4% organic noise: occasional temp artifact lingers for 2 rounds.
 			if jitter < 0.04 {
 				cls = LifetimeMedium
 				ttl = 15 * time.Minute
@@ -200,13 +215,12 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 			cls = LifetimeMedium
 			ttl = time.Duration(10+rng.IntN(25)) * time.Minute
 			sub := seq % 3
-			sz = avgChunkSize + rng.IntN(avgChunkSize)
+			sz = max(20<<10, avgChunkSize+rng.IntN(avgChunkSize/2))
 			switch sub {
 			case 0:
 				key = fmt.Sprintf("/%s/dist/bundle_%04d.tar", ws, seq)
 				meta = ObjectMeta{Path: key, Size: int64(sz), OverwriteRate: 0.30 + rng.Float64()*0.20, ProcessTag: "ci"}
 			case 1:
-				// Overlapping .bin extension shared with model weights (different dir + overwrite rate).
 				key = fmt.Sprintf("/%s/artifacts/stage_%04d.bin", ws, seq)
 				meta = ObjectMeta{Path: key, Size: int64(sz), OverwriteRate: 0.32 + rng.Float64()*0.25, ProcessTag: "ci"}
 			default:
@@ -223,7 +237,7 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 			cls = LifetimeLong
 			ttl = 24 * time.Hour
 			sub := seq % 4
-			sz = avgChunkSize + rng.IntN(avgChunkSize*3/2)
+			sz = max(22<<10, avgChunkSize+rng.IntN(avgChunkSize))
 			switch sub {
 			case 0:
 				key = fmt.Sprintf("/%s/src/pkg_%02d/module_%04d.go", ws, seq%16, seq)
@@ -235,7 +249,6 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 				key = fmt.Sprintf("/%s/checkpoints/step_%02d/weights_%04d.safetensors", ws, round, seq)
 				meta = ObjectMeta{Path: key, Size: int64(sz), OverwriteRate: rng.Float64() * 0.03, ProcessTag: "ckpt"}
 			default:
-				// Overlapping .bin extension in models/ with near-zero overwrite rate.
 				key = fmt.Sprintf("/%s/models/embed_%04d.bin", ws, seq)
 				meta = ObjectMeta{Path: key, Size: int64(sz), OverwriteRate: rng.Float64() * 0.03, ProcessTag: "ckpt"}
 			}
@@ -281,11 +294,10 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 				Payload:      payload,
 			})
 
-			// Zero-expiration boundary control: mixed lifetime classes (all 3 streams active)
-			// with zero expirations/deletions (e.g., retained build archive snapshot).
 			zeroKey := fmt.Sprintf("/%s/retained%s", ws, key[len("/"+ws):])
 			zeroMeta := meta
 			zeroMeta.Path = zeroKey
+			oracleTruth[zeroKey] = cls
 			zeroExpOps = append(zeroExpOps, TraceOp{
 				Round:        r,
 				Kind:         "put",
@@ -314,7 +326,6 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 		}
 	}
 
-	// Final cleanup round for remaining medium files from penultimate rounds.
 	lastR := totalRounds
 	if len(expireAt[lastR]) > 0 || len(expireAt[lastR+1]) > 0 {
 		for _, k := range expireAt[lastR] {
@@ -335,8 +346,133 @@ func GenerateAgentTrace(seed uint64, totalRounds, filesPerRound, avgChunkSize in
 	}
 }
 
+func OverwriteCountFromRate(rate float64) uint32 {
+	switch {
+	case rate <= 0.05:
+		return 1
+	case rate <= 0.25:
+		return 2
+	case rate <= 0.65:
+		return 3
+	default:
+		return 5
+	}
+}
+
+// ExecuteTraceOnVolume drives ops against a canonical vfs.Volume (creating
+// parent directories as needed, writing files via Create+Open+WriteAt,
+// flushing generations via Flush, removing expired files via Remove, and
+// relocating fragmented packs via CompactFragmentedPacks).
+func ExecuteTraceOnVolume(ctx context.Context, v *vfs.Volume, ops []TraceOp, maxLiveRatio float64) (
+	logicalFiles int64,
+	logicalPlainBytes int64,
+	compaction vfs.CompactionStats,
+	liveFiles map[string][]byte,
+	err error,
+) {
+	dirCache := map[string]vfs.InodeID{"/": vfs.RootInode}
+	var ensureDir func(p string) (vfs.InodeID, error)
+	ensureDir = func(p string) (vfs.InodeID, error) {
+		p = path.Clean("/" + p)
+		if id, ok := dirCache[p]; ok {
+			return id, nil
+		}
+		parentPath := path.Dir(p)
+		base := path.Base(p)
+		pid, err := ensureDir(parentPath)
+		if err != nil {
+			return 0, err
+		}
+		if in, lerr := v.Lookup(ctx, pid, base); lerr == nil {
+			dirCache[p] = in.ID
+			return in.ID, nil
+		}
+		in, merr := v.Mkdir(ctx, pid, base, 0o755)
+		if merr != nil {
+			return 0, merr
+		}
+		dirCache[p] = in.ID
+		return in.ID, nil
+	}
+
+	liveFiles = make(map[string][]byte)
+	for _, op := range ops {
+		switch op.Kind {
+		case "put":
+			clean := path.Clean("/" + op.Key)
+			dirPath := path.Dir(clean)
+			name := path.Base(clean)
+			dirID, derr := ensureDir(dirPath)
+			if derr != nil {
+				return 0, 0, compaction, nil, derr
+			}
+			var in vfs.Inode
+			if existing, lerr := v.Lookup(ctx, dirID, name); lerr == nil {
+				in = existing
+			} else {
+				created, cerr := v.Create(ctx, dirID, name, 0o644)
+				if cerr != nil {
+					return 0, 0, compaction, nil, cerr
+				}
+				in = created
+			}
+			v.SetPathHint(in.ID, clean, OverwriteCountFromRate(op.Meta.OverwriteRate))
+			fh, oerr := v.Open(ctx, in.ID)
+			if oerr != nil {
+				return 0, 0, compaction, nil, oerr
+			}
+			if _, werr := fh.WriteAt(ctx, op.Payload, 0); werr != nil {
+				_ = fh.Close()
+				return 0, 0, compaction, nil, werr
+			}
+			if cerr := fh.Close(); cerr != nil {
+				return 0, 0, compaction, nil, cerr
+			}
+			liveFiles[clean] = op.Payload
+			logicalFiles++
+			logicalPlainBytes += int64(len(op.Payload))
+
+		case "delete":
+			clean := path.Clean("/" + op.Key)
+			dirPath := path.Dir(clean)
+			name := path.Base(clean)
+			if dirID, ok := dirCache[dirPath]; ok {
+				if rerr := v.Remove(ctx, dirID, name); rerr != nil {
+					return 0, 0, compaction, nil, rerr
+				}
+				delete(liveFiles, clean)
+			}
+
+		case "checkpoint":
+			if ferr := v.Flush(ctx); ferr != nil {
+				return 0, 0, compaction, nil, ferr
+			}
+
+		case "compact":
+			st, cerr := vfs.CompactFragmentedPacks(ctx, v, maxLiveRatio)
+			if cerr != nil {
+				return 0, 0, compaction, nil, cerr
+			}
+			compaction.PacksInspected += st.PacksInspected
+			compaction.PacksCompacted += st.PacksCompacted
+			compaction.PacksDeleted += st.PacksDeleted
+			compaction.PacksPinnedSkipped += st.PacksPinnedSkipped
+			compaction.NewPacksCreated += st.NewPacksCreated
+			compaction.ChunksRelocated += st.ChunksRelocated
+			compaction.DeadChunksPruned += st.DeadChunksPruned
+			compaction.LiveBytesCopied += st.LiveBytesCopied
+			compaction.PhysicalBytesWritten += st.PhysicalBytesWritten
+			compaction.PhysicalBytesReclaimed += st.PhysicalBytesReclaimed
+		}
+	}
+	if ferr := v.Flush(ctx); ferr != nil {
+		return 0, 0, compaction, nil, ferr
+	}
+	return logicalFiles, logicalPlainBytes, compaction, liveFiles, nil
+}
+
 // ModeMetrics records real measured storage, request, timing, and memory
-// telemetry for a single unified Packer evaluation run.
+// telemetry for a single canonical vfs.Volume production packer evaluation run.
 type ModeMetrics struct {
 	Scenario               string  `json:"scenario"`
 	Name                   string  `json:"name"`
@@ -374,13 +510,13 @@ type ModeMetrics struct {
 type SuiteConfig struct {
 	ScratchDir   string
 	FullScale    bool
-	SimulatedRTT time.Duration // optional injected simulation delay (0 = unthrottled real run)
+	SimulatedRTT time.Duration
 	Seed         uint64
 }
 
 // SuiteReport bundles all measured comparisons across baseline, learned DOGI,
 // oracle upper bound, adversarial misprediction sweeps, PackTarget sweeps,
-// and negative/boundary controls.
+// and negative/boundary controls on the canonical vfs.Volume production packer.
 type SuiteReport struct {
 	Scale              string        `json:"scale"`
 	TrainSamples       int           `json:"train_samples"`
@@ -393,8 +529,9 @@ type SuiteReport struct {
 	SimulatedRTTChecks []ModeMetrics `json:"simulated_rtt_checks,omitempty"`
 }
 
-// RunSuite executes all DOGI comparative benchmarks using the unified Packer,
-// real vfs.Hybrid post-quantum Cipher, and real file:// backend stores.
+// RunSuite executes all DOGI comparative benchmarks using the actual canonical
+// vfs.Volume production packer, real vfs.Hybrid post-quantum Cipher, and real
+// file:// backend stores.
 func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 	if cfg.Seed == 0 {
 		cfg.Seed = 0x20261344
@@ -409,11 +546,11 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 		defer os.RemoveAll(scratch)
 	}
 
-	rounds, filesPerRound, avgChunk := 10, 24, 16<<10
+	rounds, filesPerRound, avgChunk := 10, 20, 22<<10
 	primaryTarget := 64 << 10
 	scaleName := "standard"
 	if cfg.FullScale {
-		rounds, filesPerRound, avgChunk = 12, 40, 24<<10
+		rounds, filesPerRound, avgChunk = 12, 32, 28<<10
 		primaryTarget = 128 << 10
 		scaleName = "full"
 	}
@@ -433,69 +570,95 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 	ciph := vfs.Hybrid(key)
 
 	runOne := func(scenario, name string, mode Mode, pred Predictor, packTarget int, ops []TraceOp, simDelay time.Duration) (ModeMetrics, error) {
-		dir := filepath.Join(scratch, strings.ReplaceAll(scenario+"_"+name, " ", "_"))
-		_ = os.RemoveAll(dir)
-		_ = os.MkdirAll(dir, 0o755)
-		rawBE, err := backend.Open(ctx, "file://"+filepath.ToSlash(dir))
+		runDir := filepath.Join(scratch, strings.ReplaceAll(scenario+"_"+name, " ", "_"))
+		_ = os.RemoveAll(runDir)
+		storeDir := filepath.Join(runDir, "store")
+		journalDir := filepath.Join(runDir, "journal")
+		_ = os.MkdirAll(storeDir, 0o755)
+		_ = os.MkdirAll(journalDir, 0o755)
+
+		rawBE, err := backend.Open(ctx, "file://"+filepath.ToSlash(storeDir))
 		if err != nil {
 			return ModeMetrics{}, err
 		}
 		defer rawBE.Close()
 		probe := NewProbeBackend(rawBE, simDelay)
 
-		pk, err := NewPacker(ctx, Config{
-			Backend:    probe,
-			Cipher:     ciph,
-			Round:      1,
-			Mode:       mode,
-			PackTarget: packTarget,
-			Predictor:  pred,
-		})
+		var packClf vfs.PackLifetimeClassifier
+		if mode == ModeLifetimeSeparated && pred != nil {
+			packClf = vfs.PackLifetimeClassifierFunc(func(pathHint string, _ vfs.InodeID, size uint64, overwrites uint32) int {
+				return int(pred.Classify(ObjectMeta{
+					Path:          pathHint,
+					Size:          int64(size),
+					OverwriteRate: OverwriteRateFromCount(overwrites),
+				}))
+			})
+		}
+
+		vcfg := vfs.Config{
+			Backend:         probe,
+			Cipher:          ciph,
+			Round:           1,
+			Journal:         journalDir,
+			JournalCapacity: 64 << 20,
+			Bound:           time.Hour,
+			PackClassifier:  packClf,
+			PackTargetBytes: packTarget,
+		}
+		if err := vfs.Create(ctx, vcfg); err != nil {
+			return ModeMetrics{}, err
+		}
+		vol, err := vfs.Attach(ctx, vcfg)
 		if err != nil {
 			return ModeMetrics{}, err
 		}
+		defer vol.Close()
 
 		var mBefore, mAfter runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&mBefore)
 		t0 := time.Now()
 
-		var compactPacksCreated int64
-		for _, op := range ops {
-			switch op.Kind {
-			case "put":
-				if err := pk.Put(ctx, op.Key, op.Payload, op.Meta); err != nil {
-					return ModeMetrics{}, err
-				}
-			case "delete":
-				if err := pk.Delete(op.Key); err != nil {
-					return ModeMetrics{}, err
-				}
-			case "checkpoint":
-				if err := pk.Checkpoint(ctx); err != nil {
-					return ModeMetrics{}, err
-				}
-			case "compact":
-				beforePacks := pk.Stats().PacksCreated
-				if _, err := pk.Compact(ctx, CompactionPolicy{GarbageRatio: 0.40}); err != nil {
-					return ModeMetrics{}, err
-				}
-				compactPacksCreated += pk.Stats().PacksCreated - beforePacks
-			}
-		}
-		if err := pk.Checkpoint(ctx); err != nil {
+		// maxLiveRatio = 0.60 corresponds to GarbageRatio >= 0.40 dead bytes.
+		logicalFiles, logicalPlain, compStats, liveFiles, err := ExecuteTraceOnVolume(ctx, vol, ops, 0.60)
+		if err != nil {
 			return ModeMetrics{}, err
 		}
-		if err := pk.CheckAccounting(); err != nil {
-			return ModeMetrics{}, err
+		if err := vol.Check(ctx); err != nil {
+			return ModeMetrics{}, fmt.Errorf("vol.Check: %w", err)
 		}
-		// Spot-check surviving live keys can be opened and verified cleanly.
-		liveKeys := pk.LiveKeys()
-		for i := 0; i < len(liveKeys) && i < 12; i++ {
-			if _, err := pk.Get(ctx, liveKeys[i]); err != nil {
-				return ModeMetrics{}, fmt.Errorf("verify live key %s: %w", liveKeys[i], err)
+
+		// Verify a standard unmodified read-only Volume (with PackClassifier: nil)
+		// opens the checkpoint and reads back surviving files cleanly.
+		ro, err := vfs.Open(ctx, vfs.Config{Backend: rawBE, Cipher: ciph})
+		if err != nil {
+			return ModeMetrics{}, fmt.Errorf("standard vfs.Open: %w", err)
+		}
+		checked := 0
+		for p, want := range liveFiles {
+			in, err := ro.Resolve(ctx, p)
+			if err != nil {
+				_ = ro.Close()
+				return ModeMetrics{}, fmt.Errorf("ro.Resolve(%s): %w", p, err)
+			}
+			fh, err := ro.Open(ctx, in.ID)
+			if err != nil {
+				_ = ro.Close()
+				return ModeMetrics{}, fmt.Errorf("ro.Open(%s): %w", p, err)
+			}
+			got := make([]byte, in.Size)
+			n, rerr := fh.ReadAt(ctx, got, 0)
+			_ = fh.Close()
+			if (rerr != nil && rerr != io.EOF) || n != len(want) || string(got) != string(want) {
+				_ = ro.Close()
+				return ModeMetrics{}, fmt.Errorf("ro.ReadAt(%s) mismatch", p)
+			}
+			checked++
+			if checked >= 8 {
+				break
 			}
 		}
+		_ = ro.Close()
 
 		wallMs := float64(time.Since(t0).Microseconds()) / 1000.0
 		runtime.ReadMemStats(&mAfter)
@@ -504,15 +667,33 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 			heapDelta = mAfter.HeapAlloc - mBefore.HeapAlloc
 		}
 
-		st := pk.Stats()
-		acc := 1.0
+		util, err := vfs.MeasurePackUtilization(ctx, vol)
+		if err != nil {
+			return ModeMetrics{}, err
+		}
+
+		physWritten := probe.PackBytesWritten.Load()
+		copiedBytes := int64(compStats.LiveBytesCopied)
+		logicalSealed := physWritten - copiedBytes
+		if logicalSealed <= 0 {
+			logicalSealed = logicalPlain
+		}
+		waf := 1.0
+		if logicalSealed > 0 {
+			waf = float64(physWritten) / float64(logicalSealed)
+		}
+
+		totalPacks := probe.PackPuts.Load()
+		compactionPacks := int64(compStats.NewPacksCreated)
+		initPacks := totalPacks - compactionPacks
+		packsDeleted := int64(compStats.PacksDeleted)
+
+		acc := 0.0
 		severe := 0
 		if pred != nil {
 			ev := EvaluateClassifier(pred, trace.HeldOutRecords)
 			acc = ev.Accuracy
 			severe = ev.SevereMispredictions
-		} else {
-			acc = 0
 		}
 
 		return ModeMetrics{
@@ -524,18 +705,18 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 			GarbageRatio:           0.40,
 			ClassifierAccuracy:     acc,
 			SevereMispredCount:     severe,
-			LogicalChunks:          st.LogicalChunksWritten,
-			LogicalPlaintextBytes:  st.LogicalPlaintextBytes,
-			LogicalSealedBytes:     st.LogicalSealedBytes,
-			PhysicalBytesWritten:   st.PhysicalBytesWritten,
-			PhysicalBytesReclaimed: st.PhysicalBytesReclaimed,
-			ActivePhysicalBytes:    st.ActivePhysicalBytes(),
-			LiveBytesCopied:        st.LiveBytesCopied,
-			WriteAmplification:     st.WriteAmplification(),
-			PacksCreated:           st.PacksCreated,
-			InitialPacksCreated:    st.PacksCreated - compactPacksCreated,
-			CompactionPacksCreated: compactPacksCreated,
-			PacksDeleted:           st.PacksDeleted,
+			LogicalChunks:          logicalFiles,
+			LogicalPlaintextBytes:  logicalPlain,
+			LogicalSealedBytes:     logicalSealed,
+			PhysicalBytesWritten:   physWritten,
+			PhysicalBytesReclaimed: int64(compStats.PhysicalBytesReclaimed),
+			ActivePhysicalBytes:    int64(util.TotalPhysicalBytes),
+			LiveBytesCopied:        copiedBytes,
+			WriteAmplification:     waf,
+			PacksCreated:           totalPacks,
+			InitialPacksCreated:    initPacks,
+			CompactionPacksCreated: compactionPacks,
+			PacksDeleted:           packsDeleted,
 			PutRequests:            probe.PutAbsents.Load() + probe.PutVers.Load() + probe.Puts.Load(),
 			GetRangeRequests:       probe.GetRanges.Load(),
 			DeleteRequests:         probe.Deletes.Load(),
@@ -559,7 +740,7 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 		return m
 	}
 
-	// 1. Primary comparison (unthrottled real file:// backend + vfs.Hybrid).
+	// 1. Primary comparison (unthrottled real file:// backend + vfs.Hybrid + canonical vfs.Volume).
 	baseRes, err := runOne("primary", "baseline-fifo", ModeBaselineSingleStream, nil, primaryTarget, trace.HeldOutOps, 0)
 	if err != nil {
 		return SuiteReport{}, err
@@ -587,7 +768,7 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 		advSweep = append(advSweep, annotateRelative(baseRes, m))
 	}
 
-	// 3. PackTarget sensitivity sweep (64 KiB, 256 KiB).
+	// 3. PackTarget sensitivity sweep (32 KiB, 64 KiB, 256 KiB).
 	var ptSweep []ModeMetrics
 	for _, pt := range []int{32 << 10, 64 << 10, 256 << 10} {
 		bPT, err := runOne("packtarget", fmt.Sprintf("baseline-%dk", pt>>10), ModeBaselineSingleStream, nil, pt, trace.HeldOutOps, 0)
@@ -601,7 +782,7 @@ func RunSuite(ctx context.Context, cfg SuiteConfig) (SuiteReport, error) {
 		ptSweep = append(ptSweep, bPT, annotateRelative(bPT, dPT))
 	}
 
-	// 4. Negative / Boundary control: 100% long-lived zero-expiration workload.
+	// 4. Negative / Boundary control: zero-expiration workload across all 3 lifetime classes.
 	ctrlBase, err := runOne("boundary-no-expiry", "baseline-fifo", ModeBaselineSingleStream, nil, primaryTarget, trace.ZeroExpirationOps, 0)
 	if err != nil {
 		return SuiteReport{}, err

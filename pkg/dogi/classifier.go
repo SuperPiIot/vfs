@@ -3,22 +3,18 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-// Package dogi implements lifetime-aware object packing for hanzoai/vfs
-// (HIP-1344, Refs #63), inspired by DOGI (USENIX FAST '26):
+// Package dogi implements the clean-room lifetime classifier and predictors for
+// hanzoai/vfs (HIP-1344, Refs #63), inspired by DOGI (USENIX FAST '26):
 //
-//   - Initial object lifetime segregation during pack construction
-//     (pack/<2hex>/<blake3>) using an online/trained held-out lifetime
-//     classifier (without oracle leakage).
-//   - A single unified canonical Packer supporting both naive single-stream
-//     FIFO co-packing (NumStreams=1) and lifetime-separated multi-stream packing
-//     (NumStreams=3), integrated with pkg/backend, pkg/fence ("head" CAS),
-//     and vfs.Cipher (ciphertext-only storage invariant).
-//   - Deterministic garbage compaction (Compact) that relocates surviving
-//     chunks before deleting dead packs while protecting concurrent Get readers.
-//
-// Distinct from asynchronous mark-and-sweep GC (#24), DOGI focuses on initial
-// placement segregation at pack construction time so short-lived build
-// temporaries expire together without forcing live long-lived data rewrites.
+//   - Write-time lifetime prediction (LifetimeEphemeral, LifetimeMedium,
+//     LifetimeLong) from strictly write-time observable features (ObjectMeta)
+//     without oracle leakage.
+//   - Direct integration with the canonical vfs.Volume production packer via
+//     vfs.PackLifetimeClassifier (ClassifyWrite), separating chunks into open
+//     pack streams while using 100% standard format-v2 128-bit random pack IDs,
+//     prolly-tree shards, and fenced Head commits.
+//   - Explicit reference OraclePredictor (NoDaP upper bound) and
+//     AdversarialPredictor wrappers for comparative and robustness evaluation.
 package dogi
 
 import (
@@ -29,7 +25,40 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hanzoai/vfs"
 )
+
+// Mode identifies whether the canonical vfs.Volume packer runs with single-stream
+// FIFO co-packing or 3-stream lifetime-separated DOGI placement.
+type Mode uint8
+
+const (
+	// ModeBaselineSingleStream uses 1 open pack stream (standard FIFO co-packing).
+	ModeBaselineSingleStream Mode = iota
+	// ModeLifetimeSeparated uses 3 open pack streams (one per Lifetime class).
+	ModeLifetimeSeparated
+)
+
+// String returns a human-readable mode identifier.
+func (m Mode) String() string {
+	switch m {
+	case ModeBaselineSingleStream:
+		return "baseline-fifo-1stream"
+	case ModeLifetimeSeparated:
+		return "dogi-lifetime-3stream"
+	default:
+		return fmt.Sprintf("mode(%d)", uint8(m))
+	}
+}
+
+// NumStreams returns the number of active open pack streams for m.
+func (m Mode) NumStreams() int {
+	if m == ModeLifetimeSeparated {
+		return NumLifetimes
+	}
+	return 1
+}
 
 // Lifetime classifies expected object survival time at pack construction.
 type Lifetime uint8
@@ -371,6 +400,38 @@ func (c *Classifier) SamplesSeen() int {
 	return c.samplesSeen
 }
 
+// OverwriteRateFromCount converts an observed per-inode write/overwrite count
+// into a normalized overwrite rate in [0.0, 1.0] for ObjectMeta feature extraction.
+func OverwriteRateFromCount(overwrites uint32) float64 {
+	switch {
+	case overwrites <= 1:
+		return 0.02
+	case overwrites == 2:
+		return 0.20
+	case overwrites == 3:
+		return 0.45
+	default:
+		return 0.85
+	}
+}
+
+// ClassifyWrite implements vfs.PackLifetimeClassifier for direct integration
+// with the canonical vfs.Volume production packer.
+func (c *Classifier) ClassifyWrite(pathHint string, _ vfs.InodeID, size uint64, overwrites uint32) int {
+	if c == nil {
+		return int(LifetimeMedium)
+	}
+	cls := c.Classify(ObjectMeta{
+		Path:          pathHint,
+		Size:          int64(size),
+		OverwriteRate: OverwriteRateFromCount(overwrites),
+	})
+	if !cls.Valid() {
+		return int(LifetimeMedium)
+	}
+	return int(cls)
+}
+
 // ClassifyOracle returns rec.TrueLifetime directly. It exists ONLY as an
 // explicit labeled upper-bound reference mode (analogous to NoDaP in DOGI) and
 // is separated by type signature from Classify(ObjectMeta).
@@ -394,10 +455,24 @@ func (o *OraclePredictor) Classify(meta ObjectMeta) Lifetime {
 	if o == nil || o.Truth == nil {
 		return LifetimeMedium
 	}
+	clean := path.Clean("/" + strings.TrimSpace(meta.Path))
+	if cls, ok := o.Truth[clean]; ok && cls.Valid() {
+		return cls
+	}
 	if cls, ok := o.Truth[meta.Path]; ok && cls.Valid() {
 		return cls
 	}
 	return LifetimeMedium
+}
+
+// ClassifyWrite implements vfs.PackLifetimeClassifier for explicit oracle
+// upper-bound reference runs on a canonical vfs.Volume.
+func (o *OraclePredictor) ClassifyWrite(pathHint string, _ vfs.InodeID, size uint64, overwrites uint32) int {
+	return int(o.Classify(ObjectMeta{
+		Path:          pathHint,
+		Size:          int64(size),
+		OverwriteRate: OverwriteRateFromCount(overwrites),
+	}))
 }
 
 // AdversarialPredictor wraps a base Predictor and corrupts predictions at
@@ -446,6 +521,16 @@ func (a *AdversarialPredictor) Classify(meta ObjectMeta) Lifetime {
 		return Lifetime((int(pred) + shift) % NumLifetimes)
 	}
 	return pred
+}
+
+// ClassifyWrite implements vfs.PackLifetimeClassifier for adversarial
+// misprediction robustness runs on a canonical vfs.Volume.
+func (a *AdversarialPredictor) ClassifyWrite(pathHint string, _ vfs.InodeID, size uint64, overwrites uint32) int {
+	return int(a.Classify(ObjectMeta{
+		Path:          pathHint,
+		Size:          int64(size),
+		OverwriteRate: OverwriteRateFromCount(overwrites),
+	}))
 }
 
 // EvalReport summarizes classification accuracy and error distribution on a

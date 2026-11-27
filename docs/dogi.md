@@ -1,8 +1,11 @@
 # Lifetime-Aware Object Packing (DOGI)
 
-Refs #63. Tracked by HIP-1344. The library is `pkg/dogi`, the CLI benchmark
-runner is `tools/dogibench`, unit tests are in `pkg/dogi/dogi_pkg_test.go`,
-live S3 / `vfs.Hybrid` integration and fault-injection suites are in
+Refs #63. Tracked by HIP-1344. The clean-room lifetime classifier and predictor
+library is `pkg/dogi`, canonical format-v2 multi-stream pack construction and
+fragmented-pack relocation live directly in root `package vfs` (`pack.go`,
+`generation.go`, `volume.go`, `dogi_volume.go`), the CLI benchmark runner is
+`tools/dogibench`, unit tests are in `pkg/dogi/dogi_pkg_test.go`, live S3 /
+`vfs.Hybrid` compatibility, snapshot-liveness, and fault-injection suites are in
 `dogi_test.go`, and the measured dataset is in `docs/dogi.csv`.
 
 ## 1. Primary reference, summary, and clean-room license audit
@@ -15,50 +18,60 @@ live S3 / `vfs.Hybrid` integration and fault-injection suites are in
   single-stream FIFO packing co-locates short-lived build temporaries (`.o`,
   `.tmp`, `/target/`, `/node_modules/.cache/`) with long-lived source files,
   checkpoints, and model weights inside the same immutable pack objects. When
-  temporaries expire, garbage collection (GC) must read, decrypt, re-pack, and
-  upload surviving live chunks (`LiveBytesCopied`), driving up Write
-  Amplification Factor (`WAF`) and object-store request load. Guided by an
-  explicit oracle upper bound (*NoDaP* in the paper), DOGI uses a lightweight
-  classifier trained on write-time observable features to segregate objects into
-  a small number of lifetime streams (`NumStreams = 3`) during initial pack
-  construction while weighing misprediction and tail-pack fragmentation costs.
-* **Clean-room license and dependency audit:** Everything in `pkg/dogi`,
-  `tools/dogibench`, `dogi_test.go`, `docs/dogi.md`, and `docs/dogi.csv` is an
-  independent, clean-room Apache-2.0 Go implementation written from first
-  principles using only the Go standard library and existing `hanzoai/vfs`
-  packages (`pkg/backend`, `pkg/backend/s3`, `pkg/backend/file`, `pkg/fence`,
-  `internal/blake3`, `internal/storetest`, and `vfs.Hybrid`). `go.mod` and
-  `go.sum` are untouched, zero external ML libraries are used, and all packages
-  compile cleanly with `CGO_ENABLED=0` on `linux/amd64` and `darwin/arm64`.
+  temporaries expire, pack reclamation must read, decrypt, re-pack, and upload
+  surviving live chunks (`LiveBytesCopied`), driving up Write Amplification
+  Factor (`WAF`) and object-store request load. Guided by an explicit oracle
+  upper bound (*NoDaP* in the paper), DOGI uses a lightweight classifier trained
+  on write-time observable features to segregate chunks into a small number of
+  lifetime streams (`NumStreams = 3`) during initial pack construction while
+  weighing misprediction and tail-pack fragmentation costs.
+* **Clean-room license and dependency audit:** Everything in `dogi_volume.go`,
+  `pkg/dogi`, `tools/dogibench`, `dogi_test.go`, `docs/dogi.md`, and
+  `docs/dogi.csv` is an independent, clean-room Apache-2.0 Go implementation
+  written from first principles using only the Go standard library and existing
+  `hanzoai/vfs` packages (`pkg/backend`, `pkg/backend/s3`, `pkg/backend/file`,
+  `pkg/fence`, `internal/blake3`, `internal/storetest`, and `vfs.Hybrid`).
+  `go.mod` and `go.sum` are untouched, zero external ML libraries are used, and
+  all packages compile cleanly with `CGO_ENABLED=0` on `linux/amd64` and
+  `darwin/arm64`.
 
-## 2. Canonical v2 Integration Boundary (Distinction from #24)
+## 2. Canonical Format-v2 Integration (Zero Custom Wire Formats)
 
-`hanzoai/vfs` maintains a strict separation between canonical v2 layout and
-supporting subsystems (`vfs -> hanzoai/s3 -> visor`):
+DOGI stream separation operates directly inside the canonical `vfs.Volume`
+production packer without introducing any new wire format, private magic bytes,
+or separate GC authority:
 
-1. **Frozen v2 wire layouts untouched:** `head.go`, `record.go`, `shard.go`, and
-   `pack.go` are unchanged.
-2. **Bounty #63 (DOGI) vs Issue #24 (Async Online GC):**
-   * **Issue #24 (`docs/SPECIFICATION.md` §11.1)** specifies online mark-and-sweep
-     reclamation of unreachable `meta/` shards and `pack/` objects across live
-     writers using store-clock grace periods.
-   * **Bounty #63 (`pkg/dogi`)** operates upstream during **initial pack
-     construction**, segregating chunks by predicted survival class into
-     `pack/<2hex>/<blake3>` streams (`ModeBaselineSingleStream` `NumStreams=1` vs
-     `ModeLifetimeSeparated` `NumStreams=3`) and providing a deterministic
-     relocation-before-delete compaction engine (`Compact`) to quantify
-     placement quality, `LiveBytesCopied`, `WAF`, and concurrent reader safety.
+1. **One canonical layout (`docs/SPECIFICATION.md` §3–§7):**
+   * Every checkpoint commits a standard fenced `Head` at `"head"` (`fence\x00`
+     header + sealed `Head` payload naming the prolly-tree `Root`).
+   * Every metadata record (`[tInode]`, `[tEntry]`, `[tData]`, `[tChunk]`) lives
+     in standard content-addressed prolly-tree shards at
+     `meta/<2hex>/<64hex-blake3>`.
+   * Every pack is named by a canonical **128-bit random `packID`** at
+     `pack/<2hex>/<32hex-random-id>` and referenced by `[tChunk][chunkID] ->
+     encodeWhere(where{pack, off, n})`.
+   * Zero private `DGHD`/`DGMN` headers, zero secondary manifests, and zero
+     BLAKE3 pack IDs exist anywhere in the codebase.
+2. **Backward & forward reader compatibility (`PackClassifier == nil`):**
+   * When `Config.PackClassifier == nil`, `vfs.Volume` uses its standard
+     single-stream FIFO `packer.cur` path.
+   * When `Config.PackClassifier != nil` (e.g., `*dogi.Classifier`),
+     `generation.settleFile` classifies each file into lifetime stream `0..2`
+     from write-time observable features (`pathHint`, `ino`, `size`,
+     `overwrites`) held in memory and appends sealed frames to `packer.streams[class]`.
+   * Because both modes emit identical format-v2 `pack/`, `meta/`, and `head`
+     objects, **an unmodified standard `vfs.Open(ctx, Config{Backend: be, Cipher: c})`
+     (with `PackClassifier: nil`) opens and reads Volumes written in either mode
+     byte-for-byte identically**, and passes `Volume.Check(ctx)` and
+     `vfs.Reseal(ctx, Config{Verify: true})`.
 3. **Rule 1 (Ciphertext-Only Storage Invariant):** Plaintext logical paths,
    file names, and object bytes are never written to backend keys or unsealed
-   objects. Chunks are sealed individually via `Cipher` (`vfs.Hybrid`: X25519 +
-   ML-KEM-768 + keyed BLAKE3 tag) bound to `(VolumeID, PlainHash)`, packed into
-   content-addressed `pack/<2hex>/<blake3>` objects via `PutIfAbsent`, indexed in
-   sealed `meta/<2hex>/<blake3>` manifests, and atomically committed onto
-   `"head"` via `pkg/fence.Store`.
+   objects. Path hints and overwrite counts are tracked strictly in memory on
+   `Volume` for write-time stream routing.
 
-## 3. HIP-1344 Architecture & Contracts (`pkg/dogi`)
+## 3. Architecture & Contracts
 
-### A. Held-Out Lifetime Classifier (`classifier.go`)
+### A. Clean-Room Held-Out Lifetime Classifier (`pkg/dogi/classifier.go`)
 * **Classes:** `LifetimeEphemeral` (`0`), `LifetimeMedium` (`1`),
   `LifetimeLong` (`2`).
 * **Zero oracle leakage:** `ObjectMeta` contains strictly write-time observable
@@ -66,112 +79,110 @@ supporting subsystems (`vfs -> hanzoai/s3 -> visor`):
   any ground-truth TTL or true lifetime label. `Classifier.Classify(ObjectMeta)`
   is a regularized multinomial logistic regression (softmax SGD with L2 decay)
   trained strictly on `Train([]TrainingRecord)` or incrementally via
-  `UpdateOnline(TrainingRecord)` over extracted features (`ext:`, `topdir:`,
-  `parent:`, `dir:`, `dir2:`, `ow:`, `size:`, `ext+ow:`, `proc:`).
-* **Explicit reference & noise wrappers:** `ClassifyOracle` / `OraclePredictor`
-  are strictly separated by signature/type for upper-bound reference runs only;
-  `AdversarialPredictor` injects controlled label flip noise for robustness
-  evaluation.
+  `UpdateOnline(TrainingRecord)` over extracted sparse features (`ext:`,
+  `topdir:`, `parent:`, `dir:`, `dir2:`, `ow:`, `size:`, `ext+ow:`, `proc:`).
+* **`vfs.PackLifetimeClassifier` implementation:** `*dogi.Classifier`,
+  `*dogi.OraclePredictor` (explicit *NoDaP* upper-bound reference), and
+  `*dogi.AdversarialPredictor` implement
+  `ClassifyWrite(pathHint string, ino vfs.InodeID, size uint64, overwrites uint32) int`
+  so they plug directly into `vfs.Config.PackClassifier`.
 
-### B. Unified Canonical `Packer` (`packer.go`)
-* **Single unified engine:** `ModeBaselineSingleStream` (`NumStreams=1`) and
-  `ModeLifetimeSeparated` (`NumStreams=3`) execute through the identical
-  `Packer` code path, `Cipher`, `PutIfAbsent` immutable pack uploader, sealed
-  `meta/` manifest builder, and `pkg/fence.Store` CAS committer on `"head"`.
-* **Immutability & Dedup Safety:** `putImmutable` writes via
-  `be.PutIfAbsent`. On `backend.ErrConflict`, it inspects `Stat` and `Get`: an
-  exact byte match reuses the existing immutable object safely, whereas a
-  differing payload size or digest fails closed with `ErrPackConflict` and
-  never overwrites.
-* **Crash / Rollback & Lost-ACK Recovery:** Before any pack upload or
-  `Checkpoint` commit, `Packer` snapshots active stream buffers, pack maps,
-  live chunk records, and accounting counters. On `Before` upload/CAS failures,
-  state rolls back atomically while keeping prior `"head"` checkpoints intact
-  and preserving `CheckAccounting() == nil`. On `After` lost-ACK errors on
-  `pack/` or `"head"`, retry/verification checks whether the exact payload or
-  `(VolumeID, Seq, ManifestRef)` already landed and recovers without duplicating
-  or losing live objects.
-
-### C. Deterministic Compaction & Concurrent Read Safety (`gc.go`)
-* `Compact(ctx, CompactionPolicy)` inspects committed packs in deterministic
-  ascending `packSeq` order, selecting packs meeting `GarbageRatio` and
-  `MinDeadBytes`.
-* Surviving chunks are read and verified via `GetRange` + `unsealFrame` while
-  pinning source packs (`activeReaders`), packed into new
-  `pack/<2hex>/<blake3>` objects, uploaded **first**, and committed to `"head"`
-  via `pkg/fence.Store` **before** deleting any dead packs.
-* `Compact` waits on `sync.Cond` (`context.AfterFunc` wakeup, zero polling)
-  until all concurrent `Get` readers pinned on a retiring pack complete before
-  issuing `be.Delete`.
+### B. Canonical Pack Utilization & Relocation (`dogi_volume.go`)
+* `MeasurePackUtilization(ctx, v *Volume, pinnedRoots ...RootRef)` scans the
+  committed prolly tree (`[tData]` live extents vs `[tChunk]` `where` records)
+  and `Backend.Stat` to compute exact live vs dead bytes per canonical 128-bit
+  `packID`.
+* `CompactFragmentedPacks(ctx, v *Volume, maxLiveRatio float64, pinnedRoots ...RootRef)`
+  relocates surviving chunks from fragmented packs whose live byte ratio is at
+  most `maxLiveRatio` (e.g. `0.60` = at least `40%` dead bytes):
+  1. **Snapshot & concurrent reader liveness:** Any pack referenced by any
+     `pinnedRoots` (such as an open read-only snapshot `Volume.CommittedRoot()`)
+     is strictly pinned and skipped (`PacksPinnedSkipped`). In-flight
+     `File.ReadAt` calls on `v` pin the root they planned against via
+     `acquireRoot`/`releaseRoot`, and `CompactFragmentedPacks` waits for
+     in-flight reads on the superseded root to drain before deleting retired
+     packs.
+  2. **Relocate-before-delete ordering:** Surviving chunks in eligible
+     fragmented packs are read via `GetRange`, unsealed and verified against
+     their `chunkID` BLAKE3 hash, packed into new canonical 128-bit random
+     `pack/<2hex>/<id>` packs, and uploaded **before** updating the prolly tree.
+  3. **Canonical prolly-tree + fenced Head commit:** Updated `[tChunk]` `where`
+     records (and deletions of dead `[tChunk]` records from reclaimed packs) are
+     applied via `v.t.using(shards).apply(...)` and committed via
+     `v.writeHead(ctx, h)` with `v.landed(ctx, h)` lost-ACK recovery.
+  4. **Safe reclamation:** Only after the new `Head` is durably committed does
+     `CompactFragmentedPacks` delete superseded packs that are unreferenced by
+     both the new `Head.Root` and all `pinnedRoots`.
 
 ## 4. Held-Out Evaluation Methodology & Matched Baseline
 
 To prevent data leakage or synthetic self-fitting:
 1. `GenerateAgentTrace` produces a chronological coding-agent build + workspace
-   workload split **40% train / 60% held-out** (`96` train / `144` held-out
-   records in `dogibench`; `112` train / `168` held-out in `dogi_test.go`).
+   workload split **40% train / 60% held-out** (`80` train / `120` held-out
+   files in `dogibench`; `54` train / `108` held-out in `dogi_test.go`).
 2. The held-out 60% uses **disjoint workspace prefixes** (`ws-gamma`,
    `ws-delta`, `ws-epsilon` vs `ws-alpha`, `ws-beta` in training), unseen file
    names, overlapping extensions (`.bin` for both `artifacts/` medium and
    `models/` long; `.log` for both `/tmp/` ephemeral and `/build/reports/`
    medium), and organic ~3–4% TTL noise.
-3. All modes execute the exact same held-out operation trace (`put`,
-   `checkpoint`, `delete`, `compact`) on the same `Packer`, same `vfs.Hybrid`
-   post-quantum `Cipher`, and same backend (`file://` with real `fsync` in
-   `tools/dogibench`, and `s3.New` over `storetest.NewS3` in `dogi_test.go`).
+3. All modes execute the exact same held-out operation trace (`Create` +
+   `WriteAt`, `Flush`, `Remove`, `CompactFragmentedPacks`) on the **actual
+   canonical `vfs.Volume` production packer**, with the same `vfs.Hybrid`
+   post-quantum `Cipher`, and verify every resulting Volume with a standard
+   unmodified `vfs.Open` (`PackClassifier: nil`) + `Volume.Check(ctx)`.
 
 ## 5. Empirical Measurements (`docs/dogi.csv` & `storetest.NewS3`)
 
-### A. Primary Held-Out Evaluation (`tools/dogibench`, `PackTarget = 64 KiB`, `file://` + `vfs.Hybrid`, unthrottled)
+### A. Primary Held-Out Evaluation (`tools/dogibench`, Canonical `vfs.Volume`, `PackTarget = 64 KiB`, `file://` + `vfs.Hybrid`, unthrottled)
 
-Held-out classifier accuracy: **95.14%** (`137/144` correct, `0` `Ephemeral <-> Long` severe swaps), `3,038,045 B` logical plaintext (`3,288,605 B` sealed across `144` chunks).
+Held-out classifier accuracy: **92.50%** (`111/120` correct, `0` `Ephemeral <-> Long` severe swaps), `3,231,035 B` logical plaintext (`3,439,835 B` initial sealed pack bytes across `120` chunked files).
 
-| Configuration | Streams | Held-Out Acc | Copied (B) | Physical Written (B) | WAF | InitPacks | GCPacks | TotalPacks | Packs Deleted | Pack OH (Net) | Backend Reqs |
+| Configuration | Streams | Held-Out Acc | Copied (B) | Physical Pack Written (B) | WAF | InitPacks | GCPacks | TotalPacks | Packs Deleted | Pack OH (Net) | Backend Reqs |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `baseline-fifo` | 1 | n/a | 1,118,792 | 4,407,397 | 1.3402 | 42 | 16 | 58 | 45 | +0.00% | 185 |
-| **`dogi-learned`** | **3** | **95.14%** | **202,157 (-81.93%)** | **3,490,762** | **1.0615 (-20.80%)** | **46** | **5** | **51** | **39** | **-12.07%** | **139 (-24.9%)** |
-| `dogi-oracle` (NoDaP ref) | 3 | 100.00% | 0 (-100.00%) | 3,288,605 | 1.0000 (-25.38%) | 48 | 0 | 48 | 36 | -17.24% | 125 |
+| `baseline-fifo` | 1 | n/a | 943,481 | 4,383,316 | 1.2743 | 45 | 14 | 59 | 42 | +0.00% | 336 |
+| **`dogi-learned`** | **3** | **92.50%** | **226,099 (-76.04%)** | **3,665,934** | **1.0657 (-16.37%)** | **49** | **5** | **54** | **39** | **-8.47%** | **288 (-14.3%)** |
+| `dogi-oracle` (NoDaP ref) | 3 | 100.00% | 0 (-100.00%) | 3,439,835 | 1.0000 (-21.52%) | 49 | 0 | 49 | 34 | -16.95% | 300 |
 
-*Notice the initial vs net pack trade-off:* before GC runs, 3-stream packing creates `+9.52%` more initial partial tail packs (`46` vs `42` `InitPacks`). Once ephemeral build temporaries expire and `Compact` runs (`GarbageRatio = 0.40`), Baseline generates `16` extra GC relocation packs while DOGI generates `5`, yielding `-12.07%` net packs and `-24.9%` total backend requests.
+*Initial vs net pack trade-off on the production packer:* before compaction runs, 3-stream packing creates `49` initial packs vs `45` for 1-stream FIFO (`+8.89%` initial partial tail packs across 3 open streams). Once ephemeral build temporaries are unlinked and `CompactFragmentedPacks` runs (`maxLiveRatio = 0.60`), 1-stream FIFO must create `14` relocation packs (`943,481 B` copied) whereas DOGI creates only `5` (`226,099 B` copied), finishing with `-8.47%` fewer total packs (`54` vs `59`) and `-14.3%` fewer total backend requests (`288` vs `336`).
 
-### B. Live HTTP S3 Protocol Server (`TestDOGIHeldOutPredictorAndRealVFSIntegration` over `storetest.NewS3`)
+### B. Live HTTP S3 Protocol Server (`TestDOGIHeldOutPredictorOnCanonicalProductionVolume` over `storetest.NewS3`)
 
-Measured with real `s3.New` client over `storetest.NewS3` + `storetest.Strict` + `vfs.Hybrid` (`112` train / `168` held-out, `96.43%` held-out accuracy, `0` severe swaps, `64 KiB` `PackTarget`):
+Measured with real `s3.New` client over `storetest.NewS3` + `storetest.Strict` + `vfs.Hybrid` on canonical `vfs.Volume` (`54` train / `108` held-out, `95.37%` held-out accuracy, `0` severe swaps, `64 KiB` `PackTarget`):
 
 | Configuration | Copied (B) | WAF | Packs Created | Packs Deleted | S3 HTTP Requests (`srv.Requests()`) |
 |---|---:|---:|---:|---:|---:|
-| `baseline-fifo-1stream` | 1,211,555 | 1.3121 | 67 | 48 | 200 |
-| `dogi-learned-3stream` | 89,362 | 1.0230 | 59 (-11.9%) | 42 | 148 |
-| `dogi-oracle-3stream` | 0 | 1.0000 | 54 | 37 | 133 |
+| `baseline-fifo-1stream` | 680,925 | 1.2189 | 50 | 33 | 283 |
+| `dogi-learned-3stream` | 150,811 (-77.85%) | 1.0485 | 51 | 37 | 268 |
+| `dogi-oracle-3stream` | 0 (-100.00%) | 1.0000 | 46 | 31 | 251 |
 
 ### C. `PackTarget` Sensitivity Sweep (`docs/dogi.csv`)
 
 | `PackTarget` | Baseline `Copied (B)` | Baseline `WAF` | DOGI `Copied (B)` | DOGI `WAF` | `LiveBytes` Reduction | `WAF` Reduction |
 |---|---:|---:|---:|---:|---:|---:|
-| `32 KiB` | 698,345 | 1.2124 | 66,758 | 1.0203 | -90.44% | -15.84% |
-| `64 KiB` | 1,118,792 | 1.3402 | 202,157 | 1.0615 | -81.93% | -20.80% |
-| `256 KiB` | 1,684,510 | 1.5122 | 167,396 | 1.0509 | -90.06% | -30.51% |
+| `32 KiB` | 1,025,916 | 1.2982 | 155,386 | 1.0452 | -84.85% | -19.49% |
+| `64 KiB` | 1,072,533 | 1.3118 | 226,099 | 1.0657 | -78.92% | -18.76% |
+| `256 KiB` | 1,586,484 | 1.4612 | 91,422 | 1.0266 | -94.24% | -29.74% |
 
-As `PackTarget` grows (`32 KiB -> 256 KiB`), Baseline FIFO co-packs more long-lived chunks with expiring temporaries (`WAF` climbs from `1.2124` to `1.5122`), whereas DOGI stays near `1.02–1.06`.
+As `PackTarget` grows (`32 KiB -> 256 KiB`), 1-stream FIFO co-packs more long-lived chunks with expiring temporaries (`WAF` climbs from `1.2982` to `1.4612`), whereas 3-stream DOGI keeps `WAF` near `1.0266–1.0657` (while paying `+4.17%` net pack count at `256 KiB`, `25` vs `24` packs, due to 3 open streams).
 
 ### D. Adversarial Misprediction & Negative / Boundary Controls (Retained Honestly)
 
 1. **Adversarial Label-Noise Sweep (`docs/dogi.csv`, `PackTarget = 64 KiB`):**
-   * `10%` flip (`84.03%` acc, `6` severe swaps): `Copied = 349,380 B`, `WAF = 1.1062`, `Packs = 56` (`-3.45%`)
-   * `25%` flip (`74.31%` acc, `10` severe swaps): `Copied = 478,593 B`, `WAF = 1.1455`, `Packs = 54` (`-6.90%`)
-   * `45%` flip (`57.64%` acc, `21` severe swaps): `Copied = 626,180 B`, `WAF = 1.1904`, `Packs = 58` (`+0.00%`)
-   * **`75%` flip (`25.00%` acc, `46` severe swaps — negative crossover):** `Copied = 939,654 B`, `WAF = 1.2857`, **`Packs = 65` (`+12.07%` net pack overhead)**, **`189` backend requests (`> 185` Baseline)**! Under extreme misprediction, multi-stream packing fragments packs without clean segregation and loses to Baseline on request and pack counts.
+   * `10%` flip (`80.00%` acc, `7` severe swaps): `Copied = 433,606 B`, `WAF = 1.1261`, `Packs = 56` (`-5.08%`)
+   * `25%` flip (`71.67%` acc, `8` severe swaps): `Copied = 497,815 B`, `WAF = 1.1447`, `Packs = 59` (`+0.00%`)
+   * `45%` flip (`52.50%` acc, `24` severe swaps — pack overhead crossover): `Copied = 852,984 B`, `WAF = 1.2480`, **`Packs = 61` (`+3.39%` net pack overhead)**
+   * **`75%` flip (`25.00%` acc, `43` severe swaps — negative crossover):** `Copied = 857,754 B`, `WAF = 1.2494`, **`Packs = 62` (`+5.08%` net pack overhead)**. Under severe misprediction, multi-stream packing fragments packs across 3 open buffers without clean lifetime isolation.
 2. **Mixed-Class Retained Archive (`boundary-no-expiry`, 0 expirations):**
-   When objects span all 3 lifetime classes (`Ephemeral`/`Medium`/`Long`) but zero expirations occur, neither mode triggers GC (`LiveBytesCopied = 0`, `WAF = 1.0000` for both), while DOGI pays **`+9.52%` pack-count overhead** (`46` vs `42` packs) and **`+4` extra PUTs** (`73` vs `69` total requests) from flushing 3 open tail streams per checkpoint instead of 1.
+   When files span all 3 lifetime classes (`Ephemeral`/`Medium`/`Long`) but zero deletions occur, neither mode triggers compaction (`LiveBytesCopied = 0`, `WAF = 1.0000` for both), while 3-stream DOGI pays **`+11.36%` pack-count overhead** (`49` vs `44` packs) from flushing up to 3 open tail streams per generation instead of 1.
 3. **Labeled Simulated RTT (`simulated-rtt`, `1.000 ms` injected per backend request):**
-   Request counts drop from `185` (Baseline) to `139` (DOGI Learned); on the shared host with real `file://` `fsync`, disk `fsync` variance dominates `1 ms` per-request sleep (`13,406.8 ms` vs `13,257.0 ms` wall time in `docs/dogi.csv`).
+   `Copied` drops by `-72.19%` (`226,099 B` vs `813,091 B`), `GetRange` requests drop from `26` to `8`, total backend requests drop from `307` to `291`, and wall time drops from `53,258.3 ms` to `43,668.9 ms`.
 
 ## 6. Reproducing
 
 ```sh
 gofmt -l .
-go vet . ./pkg/dogi ./tools/dogibench
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build . ./pkg/dogi ./tools/dogibench
+go vet . ./cmd/... ./pkg/... ./tools/...
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build . ./cmd/... ./pkg/... ./tools/...
 TMPDIR=/home/max/tmp go test -v -count=1 ./pkg/dogi
 TMPDIR=/home/max/tmp go test -v -count=1 -run '^TestDOGI' .
 TMPDIR=/home/max/tmp go run ./tools/dogibench -rtt 1ms -csv-out docs/dogi.csv
