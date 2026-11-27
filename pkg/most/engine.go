@@ -6,12 +6,16 @@
 package most
 
 import (
+	"bytes"
 	"container/list"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,14 +26,14 @@ import (
 )
 
 type cacheKey struct {
-	scope  Scope
-	tenant string // empty for ScopeSharedImmutable; tenantID for ScopePrivate
-	volID  string // empty for ScopeSharedImmutable; volID for ScopePrivate
+	scope  Scope  // canonicalized: ScopePrivate or ScopeSharedImmutable
+	tenant string // empty for immutable shared; tenantID for ScopePrivate
+	volID  string // empty for immutable shared; volID for ScopePrivate
 	key    string // logical key or range key ("<key>#<off>+<n>")
 }
 
 func (k cacheKey) hotKey() string {
-	if k.scope == ScopeSharedImmutable {
+	if k.scope.isImmutableShared() {
 		return "S:" + k.key
 	}
 	return "P:" + k.tenant + "\x00" + k.volID + "\x00" + k.key
@@ -37,30 +41,39 @@ func (k cacheKey) hotKey() string {
 
 func (k cacheKey) diskRelPath() string {
 	h := hashHex("disk", k.scope.String(), k.tenant, k.volID, k.key)
-	if k.scope == ScopeSharedImmutable {
+	if k.scope.isImmutableShared() {
 		return filepath.Join("shared", h[:2], h)
 	}
 	th := hashHex("tenantdir", k.tenant, k.volID)[:24]
 	return filepath.Join("priv", th, h[:2], h)
 }
 
+type sharedKeyMeta struct {
+	artifactID string
+	scope      Scope
+	digest     [blake3.Size]byte
+	size       int64
+}
+
 type ramEntry struct {
-	id      cacheKey
-	plain   []byte
-	cost    int64
-	ver     backend.Version
-	digest  [blake3.Size]byte
-	holders map[string]*list.Element
+	id         cacheKey
+	artifactID string
+	plain      []byte
+	cost       int64
+	ver        backend.Version
+	digest     [blake3.Size]byte
+	holders    map[string]*list.Element
 }
 
 type nvmeEntry struct {
-	id       cacheKey
-	relPath  string
-	cost     int64
-	ver      backend.Version
-	digest   [blake3.Size]byte
-	holders  map[string]*list.Element
-	isShared bool
+	id         cacheKey
+	artifactID string
+	relPath    string
+	cost       int64
+	ver        backend.Version
+	digest     [blake3.Size]byte
+	holders    map[string]*list.Element
+	isShared   bool
 }
 
 type tenantState struct {
@@ -150,25 +163,30 @@ func (f *flightGroup) do(ctx context.Context, k string, fn func() ([]byte, backe
 	}
 }
 
-// Engine manages a tenant-isolated, byte-bounded host RAM pool and disk-backed
-// NVMe cache tier in front of an underlying backend.Backend.
+// Engine manages a tenant-isolated, byte-bounded host RAM pool and encrypted
+// disk-backed NVMe cache tier in front of an underlying backend.Backend.
 type Engine struct {
-	be         backend.Backend
-	cfg        Config
-	ownNVMeDir bool
+	be           backend.Backend
+	cfg          Config
+	hostCipher   Cipher
+	ephemHost    *ephemeralHostCipher
+	manifestCiph Cipher
+	ephemManif   *ephemeralHostCipher
+	ownNVMeDir   bool
 
 	keyLocks [64]sync.Mutex
 	flights  flightGroup
 
-	mu            sync.RWMutex
-	closed        bool
-	tenants       map[string]*tenantState
-	ramEntries    map[cacheKey]*ramEntry
-	nvmeEntries   map[cacheKey]*nvmeEntry
-	globalRAM     int64
-	globalNVMe    int64
-	hot           *hotTracker
-	sharedDigests map[string][blake3.Size]byte
+	mu          sync.RWMutex
+	closed      bool
+	tenants     map[string]*tenantState
+	ramEntries  map[cacheKey]*ramEntry
+	nvmeEntries map[cacheKey]*nvmeEntry
+	globalRAM   int64
+	globalNVMe  int64
+	hot         *hotTracker
+	sharedMeta  map[string]sharedKeyMeta
+	manifests   map[string]ArtifactManifest
 
 	latencies      latencyRecorder
 	totalReads     atomic.Int64
@@ -185,6 +203,8 @@ type Engine struct {
 }
 
 // NewEngine constructs a MOST Engine wrapping be with the given configuration.
+// Every configured Cipher (HostCacheCipher, SharedManifestCipher) is verified
+// via checkCipher so identity/plaintext ciphers fail closed immediately.
 func NewEngine(be backend.Backend, cfg Config) (*Engine, error) {
 	if be == nil {
 		return nil, fmt.Errorf("%w: nil backend", ErrInvalidConfig)
@@ -198,17 +218,70 @@ func NewEngine(be backend.Backend, cfg Config) (*Engine, error) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 		}
 	}
+
+	var hostCipher Cipher
+	var ephemHost *ephemeralHostCipher
+	if norm.HostCacheCipher != nil {
+		if err := checkCipher(norm.HostCacheCipher); err != nil {
+			return nil, fmt.Errorf("%w: HostCacheCipher: %v", ErrInvalidConfig, err)
+		}
+		hostCipher = norm.HostCacheCipher
+	} else {
+		ephemHost, err = newEphemeralHostCipher()
+		if err != nil {
+			return nil, err
+		}
+		if err := checkCipher(ephemHost); err != nil {
+			ephemHost.wipe()
+			return nil, err
+		}
+		hostCipher = ephemHost
+	}
+
+	var manifestCipher Cipher
+	var ephemManif *ephemeralHostCipher
+	if norm.SharedManifestCipher != nil {
+		if err := checkCipher(norm.SharedManifestCipher); err != nil {
+			if ephemHost != nil {
+				ephemHost.wipe()
+			}
+			return nil, fmt.Errorf("%w: SharedManifestCipher: %v", ErrInvalidConfig, err)
+		}
+		manifestCipher = norm.SharedManifestCipher
+	} else {
+		ephemManif, err = newEphemeralHostCipher()
+		if err != nil {
+			if ephemHost != nil {
+				ephemHost.wipe()
+			}
+			return nil, err
+		}
+		manifestCipher = ephemManif
+	}
+
 	ownDir := false
 	nvmeDir := norm.NVMeDir
 	if nvmeDir == "" {
 		d, err := os.MkdirTemp("", "most-nvme-*")
 		if err != nil {
+			if ephemHost != nil {
+				ephemHost.wipe()
+			}
+			if ephemManif != nil {
+				ephemManif.wipe()
+			}
 			return nil, fmt.Errorf("most: create nvme temp dir: %w", err)
 		}
 		nvmeDir = d
 		ownDir = true
 	} else {
 		if err := os.MkdirAll(nvmeDir, 0o700); err != nil {
+			if ephemHost != nil {
+				ephemHost.wipe()
+			}
+			if ephemManif != nil {
+				ephemManif.wipe()
+			}
 			return nil, fmt.Errorf("most: create nvme dir: %w", err)
 		}
 	}
@@ -218,23 +291,34 @@ func NewEngine(be backend.Backend, cfg Config) (*Engine, error) {
 			if ownDir {
 				_ = os.RemoveAll(nvmeDir)
 			}
+			if ephemHost != nil {
+				ephemHost.wipe()
+			}
+			if ephemManif != nil {
+				ephemManif.wipe()
+			}
 			return nil, fmt.Errorf("most: init nvme subdir %s: %w", sub, err)
 		}
 	}
 	return &Engine{
-		be:            be,
-		cfg:           norm,
-		ownNVMeDir:    ownDir,
-		tenants:       make(map[string]*tenantState),
-		ramEntries:    make(map[cacheKey]*ramEntry),
-		nvmeEntries:   make(map[cacheKey]*nvmeEntry),
-		hot:           newHotTracker(norm.DecayHalfLife, norm.WindowOps, norm.MaxHotEntries),
-		sharedDigests: make(map[string][blake3.Size]byte),
+		be:           be,
+		cfg:          norm,
+		hostCipher:   hostCipher,
+		ephemHost:    ephemHost,
+		manifestCiph: manifestCipher,
+		ephemManif:   ephemManif,
+		ownNVMeDir:   ownDir,
+		tenants:      make(map[string]*tenantState),
+		ramEntries:   make(map[cacheKey]*ramEntry),
+		nvmeEntries:  make(map[cacheKey]*nvmeEntry),
+		hot:          newHotTracker(norm.DecayHalfLife, norm.WindowOps, norm.MaxHotEntries),
+		sharedMeta:   make(map[string]sharedKeyMeta),
+		manifests:    make(map[string]ArtifactManifest),
 	}, nil
 }
 
-// Close zeros all cached RAM buffers, drops metadata, and cleans up the NVMe
-// directory if it was auto-created by NewEngine.
+// Close zeros all cached RAM buffers and ephemeral host keys, drops metadata,
+// and cleans up the NVMe directory if it was auto-created by NewEngine.
 func (e *Engine) Close() error {
 	e.mu.Lock()
 	if e.closed {
@@ -248,6 +332,8 @@ func (e *Engine) Close() error {
 	}
 	e.ramEntries = nil
 	e.nvmeEntries = nil
+	e.sharedMeta = nil
+	e.manifests = nil
 	e.globalRAM = 0
 	e.globalNVMe = 0
 	for _, t := range e.tenants {
@@ -258,6 +344,12 @@ func (e *Engine) Close() error {
 		t.ramLRU.Init()
 		t.nvmeLRU.Init()
 	}
+	if e.ephemHost != nil {
+		e.ephemHost.wipe()
+	}
+	if e.ephemManif != nil {
+		e.ephemManif.wipe()
+	}
 	e.mu.Unlock()
 	if e.ownNVMeDir && e.cfg.NVMeDir != "" {
 		return os.RemoveAll(e.cfg.NVMeDir)
@@ -265,12 +357,17 @@ func (e *Engine) Close() error {
 	return nil
 }
 
-// RegisterTenant registers or replaces a tenant binding with explicit volume ID,
-// Cipher, and RAM/NVMe byte quotas (0 disables caching in that tier;
-// UnlimitedQuota / < 0 inherits Engine global bounds).
+// RegisterTenant registers a tenant binding with explicit volume ID, verified
+// per-tenant Cipher (when non-nil), and RAM/NVMe byte quotas (0 disables caching
+// in that tier; UnlimitedQuota / < 0 inherits Engine global bounds).
 func (e *Engine) RegisterTenant(tenantID, volID string, cipher Cipher, quotaRAM, quotaNVMe int64) error {
 	if tenantID == "" || volID == "" {
 		return fmt.Errorf("%w: tenantID and volID are required", ErrInvalidConfig)
+	}
+	if cipher != nil {
+		if err := checkCipher(cipher); err != nil {
+			return fmt.Errorf("%w: tenant %q cipher: %v", ErrInvalidConfig, tenantID, err)
+		}
 	}
 	tvHash := hashHex("tv", tenantID, volID)
 	e.mu.Lock()
@@ -295,9 +392,11 @@ func (e *Engine) RegisterTenant(tenantID, volID string, cipher Cipher, quotaRAM,
 	return nil
 }
 
-// SetSharedAccess updates the shared immutable toolchain ACL for a tenant.
-// When allowed is true and allowedPrefixes is empty, all shared keys are allowed;
-// otherwise only keys matching at least one prefix are permitted.
+// SetSharedAccess updates the shared/public immutable toolchain ACL for a tenant.
+// When allowed is false, all shared/public immutable access is immediately blocked
+// and any resident shared RAM/NVMe references held by tenantID are detached.
+// When allowed is true and allowedPrefixes is empty, all registered shared keys
+// are allowed; otherwise only keys matching at least one prefix are permitted.
 func (e *Engine) SetSharedAccess(tenantID string, allowed bool, allowedPrefixes ...string) error {
 	e.mu.RLock()
 	t := e.tenants[tenantID]
@@ -307,16 +406,21 @@ func (e *Engine) SetSharedAccess(tenantID string, allowed bool, allowedPrefixes 
 	}
 	t.lifecycleMu.Lock()
 	defer t.lifecycleMu.Unlock()
+
+	var removeFiles []string
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if t.revoked {
+		e.mu.Unlock()
 		return ErrTenantUnauthorized
 	}
 	t.sharedAllowed = allowed
 	t.sharedPrefix = append([]string(nil), allowedPrefixes...)
-	if !allowed {
-		// Detach any shared RAM/NVMe holders belonging to this tenant.
-		e.detachTenantScopeLocked(t, ScopeSharedImmutable)
+	// Detach any shared RAM/NVMe holders that this tenant is no longer permitted to access.
+	removeFiles = e.detachDisallowedSharedLocked(t)
+	e.mu.Unlock()
+
+	for _, p := range removeFiles {
+		_ = os.Remove(p)
 	}
 	return nil
 }
@@ -344,7 +448,7 @@ func (e *Engine) RevokeTenant(tenantID string) error {
 		t.revoked = true
 		t.cipher = nil
 		t.sharedAllowed = false
-		privDir = filepath.Join(e.cfg.NVMeDir, "priv", t.tvHash[:24])
+		privDir = filepath.Join(e.cfg.NVMeDir, "priv", hashHex("tenantdir", t.id, t.volID)[:24])
 
 		for el := t.ramLRU.Front(); el != nil; el = el.Next() {
 			k := el.Value.(cacheKey)
@@ -396,12 +500,17 @@ func (e *Engine) RevokeTenant(tenantID string) error {
 	return nil
 }
 
-func (e *Engine) detachTenantScopeLocked(t *tenantState, scope Scope) {
+func (e *Engine) detachDisallowedSharedLocked(t *tenantState) []string {
+	var orphanFiles []string
 	var next *list.Element
 	for el := t.ramLRU.Front(); el != nil; el = next {
 		next = el.Next()
 		k := el.Value.(cacheKey)
-		if k.scope != scope {
+		if !k.scope.isImmutableShared() {
+			continue
+		}
+		baseKey, _, _ := splitRangeKey(k.key)
+		if t.allowsShared(baseKey) {
 			continue
 		}
 		t.ramLRU.Remove(el)
@@ -419,7 +528,11 @@ func (e *Engine) detachTenantScopeLocked(t *tenantState, scope Scope) {
 	for el := t.nvmeLRU.Front(); el != nil; el = next {
 		next = el.Next()
 		k := el.Value.(cacheKey)
-		if k.scope != scope {
+		if !k.scope.isImmutableShared() {
+			continue
+		}
+		baseKey, _, _ := splitRangeKey(k.key)
+		if t.allowsShared(baseKey) {
 			continue
 		}
 		t.nvmeLRU.Remove(el)
@@ -429,30 +542,337 @@ func (e *Engine) detachTenantScopeLocked(t *tenantState, scope Scope) {
 			if len(ne.holders) == 0 {
 				delete(e.nvmeEntries, k)
 				e.globalNVMe -= ne.cost
-				_ = os.Remove(filepath.Join(e.cfg.NVMeDir, ne.relPath))
+				orphanFiles = append(orphanFiles, filepath.Join(e.cfg.NVMeDir, ne.relPath))
 			}
 		}
 	}
+	return orphanFiles
 }
 
-// RegisterSharedDigest pins the expected BLAKE3 digest for a shared immutable key.
-func (e *Engine) RegisterSharedDigest(key string, digest [blake3.Size]byte) {
+func splitRangeKey(k string) (baseKey string, isRange bool, err error) {
+	idx := strings.LastIndexByte(k, '#')
+	if idx < 0 {
+		return k, false, nil
+	}
+	return k[:idx], true, nil
+}
+
+func (e *Engine) resolveManifestCipher(c Cipher) (Cipher, error) {
+	if c != nil {
+		if err := checkCipher(c); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	return e.manifestCiph, nil
+}
+
+func (e *Engine) manifestBackendKey(artifactID string) (string, error) {
+	if artifactID == "" {
+		return "", fmt.Errorf("%w: empty artifactID", ErrInvalidConfig)
+	}
+	if err := backend.ValidPrefix(artifactID); err != nil {
+		return "", fmt.Errorf("%w: invalid artifactID %q: %v", ErrInvalidConfig, artifactID, err)
+	}
+	mh := hashHex("manifest-key", artifactID)
+	return e.sharedBackendKey(manifestKeyDir + mh[:2] + "/" + mh), nil
+}
+
+func (e *Engine) putImmutableBackendObject(ctx context.Context, beKey string, payload []byte, wantDigest [blake3.Size]byte) error {
+	_, err := e.be.PutIfAbsent(ctx, beKey, payload)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, backend.ErrConflict) {
+		return err
+	}
+	// Conditional conflict: fetch existing object and verify byte-for-byte / BLAKE3 identity.
+	existing, _, gerr := e.be.Get(ctx, beKey, backend.Unbounded)
+	if gerr != nil {
+		return fmt.Errorf("%w: conflict check failed for %s: %v", ErrImmutableConflict, beKey, gerr)
+	}
+	gotSum := blake3.Sum(existing)
+	if int64(len(existing)) != int64(len(payload)) || subtle.ConstantTimeCompare(gotSum[:], wantDigest[:]) != 1 {
+		e.integrityErrs.Add(1)
+		return fmt.Errorf("%w: existing immutable object %s differs from published payload", ErrImmutableConflict, beKey)
+	}
+	return nil
+}
+
+func (e *Engine) registerManifestLocked(m ArtifactManifest) error {
+	scope := m.Scope
+	if scope == 0 {
+		scope = ScopeSharedImmutable
+	}
+	if !scope.isImmutableShared() {
+		return fmt.Errorf("%w: invalid manifest scope %v", ErrInvalidConfig, scope)
+	}
+	if prev, exists := e.manifests[m.ArtifactID]; exists {
+		if !manifestsEqual(prev, m) {
+			e.integrityErrs.Add(1)
+			return fmt.Errorf("%w: manifest %q conflicts with already-registered manifest", ErrImmutableConflict, m.ArtifactID)
+		}
+		return nil
+	}
+	// First check all entries for conflicts before mutating Engine state atomically.
+	for k, entry := range m.Entries {
+		if prevMeta, ok := e.sharedMeta[k]; ok {
+			if prevMeta.digest != entry.Digest || prevMeta.size != entry.Size {
+				e.integrityErrs.Add(1)
+				return fmt.Errorf("%w: shared key %q already registered with different digest/size", ErrImmutableConflict, k)
+			}
+		}
+	}
+	cpEntries := make(map[string]ManifestEntry, len(m.Entries))
+	for k, entry := range m.Entries {
+		cpEntries[k] = entry
+		e.sharedMeta[k] = sharedKeyMeta{
+			artifactID: m.ArtifactID,
+			scope:      scope,
+			digest:     entry.Digest,
+			size:       entry.Size,
+		}
+	}
+	e.manifests[m.ArtifactID] = ArtifactManifest{
+		ArtifactID: m.ArtifactID,
+		Scope:      scope,
+		Version:    m.Version,
+		Entries:    cpEntries,
+	}
+	return nil
+}
+
+func manifestsEqual(a, b ArtifactManifest) bool {
+	sa, sb := a.Scope, b.Scope
+	if sa == 0 {
+		sa = ScopeSharedImmutable
+	}
+	if sb == 0 {
+		sb = ScopeSharedImmutable
+	}
+	if a.ArtifactID != b.ArtifactID || sa != sb || a.Version != b.Version || len(a.Entries) != len(b.Entries) {
+		return false
+	}
+	for k, ea := range a.Entries {
+		eb, ok := b.Entries[k]
+		if !ok || ea.Digest != eb.Digest || ea.Size != eb.Size {
+			return false
+		}
+	}
+	return true
+}
+
+// PublishSharedArtifact conditionally publishes an immutable set of shared
+// toolchain objects via backend.PutIfAbsent, seals an ArtifactManifest with
+// manifestCipher (domain-separated AAD ["most-manifest-v1" | artifactID]),
+// conditionally publishes the manifest via PutIfAbsent, and atomically registers
+// the verified entries in Engine.
+//
+// Concurrent or retry calls with identical payloads and manifest entries succeed
+// idempotently; any attempt to replace an existing key or manifest with different
+// content fails closed with ErrImmutableConflict.
+func (e *Engine) PublishSharedArtifact(ctx context.Context, artifactID string, files map[string][]byte, manifestCipher Cipher) (*ArtifactManifest, error) {
+	return e.PublishArtifactWithScope(ctx, artifactID, ScopeSharedImmutable, 1, files, manifestCipher)
+}
+
+// PublishPublicArtifact conditionally publishes an explicitly public toolchain
+// artifact (ScopePublicImmutable) and its Cipher-authenticated ArtifactManifest.
+func (e *Engine) PublishPublicArtifact(ctx context.Context, artifactID string, files map[string][]byte, manifestCipher Cipher) (*ArtifactManifest, error) {
+	return e.PublishArtifactWithScope(ctx, artifactID, ScopePublicImmutable, 1, files, manifestCipher)
+}
+
+// PublishArtifactWithScope conditionally publishes immutable objects under
+// ScopeSharedImmutable or ScopePublicImmutable and seals their ArtifactManifest.
+func (e *Engine) PublishArtifactWithScope(ctx context.Context, artifactID string, scope Scope, version uint64, files map[string][]byte, manifestCipher Cipher) (*ArtifactManifest, error) {
+	if !scope.isImmutableShared() {
+		return nil, fmt.Errorf("%w: PublishArtifactWithScope requires immutable shared/public scope, got %v", ErrInvalidConfig, scope)
+	}
+	mc, err := e.resolveManifestCipher(manifestCipher)
+	if err != nil {
+		return nil, err
+	}
+	mKey, err := e.manifestBackendKey(artifactID)
+	if err != nil {
+		return nil, err
+	}
+
+	keys := slices.Sorted(maps.Keys(files))
+	entries := make(map[string]ManifestEntry, len(keys))
+	for _, k := range keys {
+		if err := backend.ValidPrefix(k); err != nil {
+			return nil, fmt.Errorf("%w: invalid shared key %q: %v", ErrInvalidConfig, k, err)
+		}
+		if strings.HasPrefix(k, manifestKeyDir) {
+			return nil, fmt.Errorf("%w: reserved manifest prefix in key %q", ErrInvalidConfig, k)
+		}
+		data := files[k]
+		sum := blake3.Sum(data)
+		beKey := e.sharedBackendKey(k)
+		if err := e.putImmutableBackendObject(ctx, beKey, data, sum); err != nil {
+			return nil, err
+		}
+		entries[k] = ManifestEntry{
+			Digest: sum,
+			Size:   int64(len(data)),
+		}
+	}
+
+	manifest := ArtifactManifest{
+		ArtifactID: artifactID,
+		Scope:      scope,
+		Version:    version,
+		Entries:    entries,
+	}
+	if err := e.publishAndRegisterManifest(ctx, mKey, manifest, mc); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+// SnapshotPrefixManifest scans existing immutable objects in the Engine's
+// shared prefix (e.g. a finalized read-only base Volume image), seals an
+// authenticated ArtifactManifest via manifestCipher, conditionally writes it
+// via PutIfAbsent, and registers all entries for fail-closed reads.
+func (e *Engine) SnapshotPrefixManifest(ctx context.Context, artifactID string, scope Scope, manifestCipher Cipher) (*ArtifactManifest, error) {
+	if !scope.isImmutableShared() {
+		return nil, fmt.Errorf("%w: SnapshotPrefixManifest requires immutable shared/public scope", ErrInvalidConfig)
+	}
+	mc, err := e.resolveManifestCipher(manifestCipher)
+	if err != nil {
+		return nil, err
+	}
+	mKey, err := e.manifestBackendKey(artifactID)
+	if err != nil {
+		return nil, err
+	}
+
+	var basePrefix string
+	if e.cfg.SharedPrefix != "" {
+		basePrefix = e.cfg.SharedPrefix + "/"
+	}
+	objs, errCh := e.be.List(ctx, basePrefix)
+	entries := make(map[string]ManifestEntry)
+	for o := range objs {
+		logical := strings.TrimPrefix(o.Key, basePrefix)
+		if logical == "" || strings.HasPrefix(logical, manifestKeyDir) {
+			continue
+		}
+		raw, _, err := e.be.Get(ctx, o.Key, backend.Unbounded)
+		if err != nil {
+			return nil, err
+		}
+		entries[logical] = ManifestEntry{
+			Digest: blake3.Sum(raw),
+			Size:   int64(len(raw)),
+		}
+	}
+	if err := <-errCh; err != nil {
+		return nil, err
+	}
+
+	manifest := ArtifactManifest{
+		ArtifactID: artifactID,
+		Scope:      scope,
+		Version:    1,
+		Entries:    entries,
+	}
+	if err := e.publishAndRegisterManifest(ctx, mKey, manifest, mc); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func (e *Engine) publishAndRegisterManifest(ctx context.Context, mKey string, manifest ArtifactManifest, mc Cipher) error {
+	sealed, err := sealManifest(mc, manifest)
+	if err != nil {
+		return err
+	}
+	_, err = e.be.PutIfAbsent(ctx, mKey, sealed)
+	if err != nil {
+		if !errors.Is(err, backend.ErrConflict) {
+			return err
+		}
+		// Conflict on manifest key: open & authenticate existing manifest and compare entries!
+		existingRaw, _, gerr := e.be.Get(ctx, mKey, backend.Unbounded)
+		if gerr != nil {
+			return fmt.Errorf("%w: read conflicting manifest %q: %v", ErrImmutableConflict, manifest.ArtifactID, gerr)
+		}
+		existingMan, uerr := unsealManifest(mc, manifest.ArtifactID, existingRaw)
+		if uerr != nil {
+			e.integrityErrs.Add(1)
+			return fmt.Errorf("%w: existing manifest %q failed authentication: %v", ErrImmutableConflict, manifest.ArtifactID, uerr)
+		}
+		if !manifestsEqual(existingMan, manifest) {
+			e.integrityErrs.Add(1)
+			return fmt.Errorf("%w: manifest %q already exists with different entries", ErrImmutableConflict, manifest.ArtifactID)
+		}
+	}
+
 	e.mu.Lock()
-	e.sharedDigests[key] = digest
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrTenantUnauthorized
+	}
+	return e.registerManifestLocked(manifest)
 }
 
-// PublishShared writes an immutable shared object to the underlying backend and
-// records its BLAKE3 digest so every future fetch, NVMe read, and RAM promotion
-// verifies content integrity fail-closed.
-func (e *Engine) PublishShared(ctx context.Context, key string, data []byte) ([blake3.Size]byte, error) {
-	sum := blake3.Sum(data)
-	beKey := e.sharedBackendKey(key)
-	if err := e.be.Put(ctx, beKey, data); err != nil {
+// LoadArtifactManifest fetches the sealed manifest for artifactID from the
+// underlying backend, authenticates and decrypts it via manifestCipher, and
+// atomically registers its (key -> digest, size) entries into Engine.
+// Tampered or unauthenticated manifests fail closed with ErrIntegrityViolation.
+func (e *Engine) LoadArtifactManifest(ctx context.Context, artifactID string, manifestCipher Cipher) (*ArtifactManifest, error) {
+	mc, err := e.resolveManifestCipher(manifestCipher)
+	if err != nil {
+		e.integrityErrs.Add(1)
+		return nil, err
+	}
+	mKey, err := e.manifestBackendKey(artifactID)
+	if err != nil {
+		return nil, err
+	}
+	raw, _, err := e.be.Get(ctx, mKey, backend.Unbounded)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := unsealManifest(mc, artifactID, raw)
+	if err != nil {
+		e.integrityErrs.Add(1)
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil, ErrTenantUnauthorized
+	}
+	if err := e.registerManifestLocked(manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+// PublishSharedObject conditionally publishes a single immutable shared object
+// under its own authenticated single-entry ArtifactManifest ("obj/"+key).
+func (e *Engine) PublishSharedObject(ctx context.Context, key string, data []byte, manifestCipher Cipher) ([blake3.Size]byte, error) {
+	if key == "" {
+		return [blake3.Size]byte{}, fmt.Errorf("%w: empty shared key", ErrInvalidConfig)
+	}
+	if err := backend.ValidPrefix(key); err != nil {
+		return [blake3.Size]byte{}, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	artID := "obj/" + key
+	m, err := e.PublishSharedArtifact(ctx, artID, map[string][]byte{key: data}, manifestCipher)
+	if err != nil {
 		return [blake3.Size]byte{}, err
 	}
-	e.RegisterSharedDigest(key, sum)
-	return sum, nil
+	return m.Entries[key].Digest, nil
+}
+
+// PublishShared conditionally publishes a single immutable shared object via
+// PutIfAbsent along with a Cipher-authenticated manifest sealed under the
+// Engine's SharedManifestCipher, rejecting conflicting replacements with
+// ErrImmutableConflict.
+func (e *Engine) PublishShared(ctx context.Context, key string, data []byte) ([blake3.Size]byte, error) {
+	return e.PublishSharedObject(ctx, key, data, nil)
 }
 
 func (e *Engine) sharedBackendKey(key string) string {
@@ -498,13 +918,45 @@ func (e *Engine) authorizeLocked(t *tenantState, scope Scope, logicalKey string)
 		}
 		return nil
 	}
-	if scope == ScopeSharedImmutable {
-		if !t.allowsShared(logicalKey) {
+	if scope.isImmutableShared() {
+		baseKey, _, _ := splitRangeKey(logicalKey)
+		if !t.allowsShared(baseKey) {
 			return ErrTenantUnauthorized
 		}
 		return nil
 	}
 	return ErrTenantUnauthorized
+}
+
+func (e *Engine) authorizeSharedKeyLocked(t *tenantState, reqScope Scope, baseKey string, meta sharedKeyMeta) error {
+	if err := e.authorizeLocked(t, reqScope, baseKey); err != nil {
+		return err
+	}
+	// ScopePublicImmutable callers can read ONLY artifacts explicitly published as ScopePublicImmutable!
+	if reqScope == ScopePublicImmutable && meta.scope != ScopePublicImmutable {
+		return ErrTenantUnauthorized
+	}
+	return nil
+}
+
+func (e *Engine) lookupSharedMeta(t *tenantState, reqScope Scope, baseKey string) (sharedKeyMeta, error) {
+	e.mu.RLock()
+	authErr := e.authorizeLocked(t, reqScope, baseKey)
+	meta, ok := e.sharedMeta[baseKey]
+	if authErr == nil && ok {
+		authErr = e.authorizeSharedKeyLocked(t, reqScope, baseKey, meta)
+	}
+	e.mu.RUnlock()
+	if authErr != nil {
+		e.unauthAttempts.Add(1)
+		return sharedKeyMeta{}, authErr
+	}
+	if !ok {
+		e.integrityErrs.Add(1)
+		e.unauthAttempts.Add(1)
+		return sharedKeyMeta{}, fmt.Errorf("%w: %s", ErrUnregisteredArtifact, baseKey)
+	}
+	return meta, nil
 }
 
 func (e *Engine) effectiveQuotaRAM(t *tenantState) int64 {
@@ -523,7 +975,7 @@ func (e *Engine) effectiveQuotaNVMe(t *tenantState) int64 {
 
 // Get reads key within scope on behalf of tenantID, serving from RAM -> NVMe ->
 // underlying backend according to the Engine's Policy and verifying tenant AAD
-// or shared BLAKE3 integrity.
+// or manifest-registered BLAKE3 integrity fail-closed.
 func (e *Engine) Get(ctx context.Context, tenantID string, scope Scope, key string, max int64) ([]byte, error) {
 	t, err := e.getTenant(tenantID)
 	if err != nil {
@@ -532,8 +984,11 @@ func (e *Engine) Get(ctx context.Context, tenantID string, scope Scope, key stri
 	var beKey string
 	if scope == ScopePrivate {
 		beKey = e.privateEngineBackendKey(t.tvHash, key)
-	} else {
+	} else if scope.isImmutableShared() {
 		beKey = e.sharedBackendKey(key)
+	} else {
+		e.unauthAttempts.Add(1)
+		return nil, ErrTenantUnauthorized
 	}
 	b, _, err := e.getWithKeys(ctx, t, scope, key, beKey, max)
 	return b, err
@@ -575,28 +1030,43 @@ func (e *Engine) getWithKeys(ctx context.Context, t *tenantState, scope Scope, l
 }
 
 func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope Scope, logicalKey, beKey string, max int64) ([]byte, backend.Version, error) {
-	e.mu.RLock()
-	authErr := e.authorizeLocked(t, scope, logicalKey)
-	ciph := t.cipher
-	volID := t.volID
-	e.mu.RUnlock()
-	if authErr != nil {
+	var sharedMeta sharedKeyMeta
+	var ciph Cipher
+	var volID string
+
+	if scope == ScopePrivate {
+		e.mu.RLock()
+		authErr := e.authorizeLocked(t, scope, logicalKey)
+		ciph = t.cipher
+		volID = t.volID
+		e.mu.RUnlock()
+		if authErr != nil {
+			e.unauthAttempts.Add(1)
+			return nil, "", authErr
+		}
+	} else if scope.isImmutableShared() {
+		var err error
+		sharedMeta, err = e.lookupSharedMeta(t, scope, logicalKey)
+		if err != nil {
+			return nil, "", err
+		}
+	} else {
 		e.unauthAttempts.Add(1)
-		return nil, "", authErr
+		return nil, "", ErrTenantUnauthorized
 	}
 
 	start := time.Now()
 	e.totalReads.Add(1)
 	t.reads.Add(1)
 
-	ck := cacheKey{scope: scope, key: logicalKey}
+	ck := cacheKey{scope: canonicalCacheScope(scope), key: logicalKey}
 	if scope == ScopePrivate {
 		ck.tenant = t.id
 		ck.volID = volID
 	}
 
 	// Tier 1: RAM check.
-	if b, ver, ok, err := e.tryRAMHit(t, ck, max); ok || err != nil {
+	if b, ver, ok, err := e.tryRAMHit(t, scope, ck, sharedMeta, max); ok || err != nil {
 		dur := time.Since(start)
 		e.latencies.record(dur)
 		t.latencies.record(dur)
@@ -604,7 +1074,7 @@ func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope S
 	}
 
 	// Tier 2: NVMe check (under per-key shard lock so disk read & eviction don't race).
-	b, ver, ok, err := e.tryNVMeRead(t, ck, ciph, max)
+	b, ver, ok, err := e.tryNVMeRead(t, scope, ck, ciph, sharedMeta, max)
 	if err != nil {
 		dur := time.Since(start)
 		e.latencies.record(dur)
@@ -621,11 +1091,10 @@ func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope S
 	// Tier 3: Backend fetch (singleflight coalesced per isolated flight key).
 	fk := ck.hotKey() + "\x00" + beKey
 	plain, ver, err := e.flights.do(ctx, fk, func() ([]byte, backend.Version, error) {
-		// Re-check RAM/NVMe in case another flight just populated it.
-		if rb, rver, rok, rerr := e.tryRAMHit(t, ck, backend.Unbounded); rok || rerr != nil {
+		if rb, rver, rok, rerr := e.tryRAMHit(t, scope, ck, sharedMeta, backend.Unbounded); rok || rerr != nil {
 			return rb, rver, rerr
 		}
-		if nb, nver, nok, nerr := e.tryNVMeRead(t, ck, ciph, backend.Unbounded); nok || nerr != nil {
+		if nb, nver, nok, nerr := e.tryNVMeRead(t, scope, ck, ciph, sharedMeta, backend.Unbounded); nok || nerr != nil {
 			return nb, nver, nerr
 		}
 
@@ -643,6 +1112,7 @@ func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope S
 		var plain []byte
 		var digest [blake3.Size]byte
 		var diskFrame []byte
+		var artID string
 		if scope == ScopePrivate {
 			plain, err = unsealPrivate(ciph, t.id, volID, logicalKey, raw)
 			if err != nil {
@@ -651,16 +1121,25 @@ func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope S
 			}
 			diskFrame = raw
 		} else {
+			if int64(len(raw)) != sharedMeta.size {
+				e.integrityErrs.Add(1)
+				return nil, "", fmt.Errorf("%w: shared key %s size %d != manifest size %d", ErrIntegrityViolation, logicalKey, len(raw), sharedMeta.size)
+			}
 			digest = blake3.Sum(raw)
-			if err := e.verifyAndPinSharedDigest(logicalKey, digest); err != nil {
+			if subtle.ConstantTimeCompare(digest[:], sharedMeta.digest[:]) != 1 {
+				e.integrityErrs.Add(1)
+				return nil, "", fmt.Errorf("%w: shared key %s digest mismatch against manifest %s", ErrIntegrityViolation, logicalKey, sharedMeta.artifactID)
+			}
+			artID = sharedMeta.artifactID
+			plain = raw
+			diskFrame, err = sealSharedFrame(e.hostCipher, artID, logicalKey, digest, plain)
+			if err != nil {
 				e.integrityErrs.Add(1)
 				return nil, "", err
 			}
-			plain = raw
-			diskFrame = encodeSharedFrame(digest, plain)
 		}
 
-		if err := e.admitOnMiss(t, ck, ciph, plain, diskFrame, digest, ver); err != nil {
+		if err := e.admitOnMiss(t, scope, ck, artID, plain, diskFrame, digest, ver); err != nil {
 			return nil, "", err
 		}
 		return plain, ver, nil
@@ -684,6 +1163,8 @@ func (e *Engine) getWithKeysRLocked(ctx context.Context, t *tenantState, scope S
 }
 
 // GetRange reads n bytes starting at off from key within scope on behalf of tenantID.
+// For immutable shared/public keys, range reads verify the full parent object against
+// its manifest-registered BLAKE3 digest (zero unauthenticated sub-slice TOFU).
 func (e *Engine) GetRange(ctx context.Context, tenantID string, scope Scope, key string, off, n int64) ([]byte, error) {
 	t, err := e.getTenant(tenantID)
 	if err != nil {
@@ -692,8 +1173,11 @@ func (e *Engine) GetRange(ctx context.Context, tenantID string, scope Scope, key
 	var beKey string
 	if scope == ScopePrivate {
 		beKey = e.privateEngineBackendKey(t.tvHash, key)
-	} else {
+	} else if scope.isImmutableShared() {
 		beKey = e.sharedBackendKey(key)
+	} else {
+		e.unauthAttempts.Add(1)
+		return nil, ErrTenantUnauthorized
 	}
 	return e.getRangeForBackend(ctx, tenantID, scope, key, beKey, off, n)
 }
@@ -706,7 +1190,6 @@ func (e *Engine) getRangeForBackend(ctx context.Context, tenantID string, scope 
 	if err != nil {
 		return nil, err
 	}
-	// For ScopePrivate, private objects are sealed as a single AEAD unit.
 	if scope == ScopePrivate {
 		full, _, err := e.getWithKeys(ctx, t, scope, logicalKey, beKey, backend.Unbounded)
 		if err != nil {
@@ -717,110 +1200,58 @@ func (e *Engine) getRangeForBackend(ctx context.Context, tenantID string, scope 
 		}
 		return append([]byte(nil), full[off:off+n]...), nil
 	}
+	if !scope.isImmutableShared() {
+		e.unauthAttempts.Add(1)
+		return nil, ErrTenantUnauthorized
+	}
 
-	// For ScopeSharedImmutable: first check if the full object is already cached in RAM/NVMe.
+	// Authenticate the parent key against its registered ArtifactManifest first (fail closed if unregistered!).
 	t.lifecycleMu.RLock()
 	defer t.lifecycleMu.RUnlock()
 
-	e.mu.RLock()
-	authErr := e.authorizeLocked(t, scope, logicalKey)
-	fullCK := cacheKey{scope: ScopeSharedImmutable, key: logicalKey}
-	_, hasFullRAM := e.ramEntries[fullCK]
-	_, hasFullNVMe := e.nvmeEntries[fullCK]
-	e.mu.RUnlock()
-	if authErr != nil {
-		e.unauthAttempts.Add(1)
-		return nil, authErr
+	sharedMeta, err := e.lookupSharedMeta(t, scope, logicalKey)
+	if err != nil {
+		return nil, err
+	}
+	if off+n > sharedMeta.size {
+		return nil, fmt.Errorf("most: range %d+%d outside %s (%d bytes)", off, n, logicalKey, sharedMeta.size)
 	}
 
-	if hasFullRAM || hasFullNVMe {
-		full, _, err := e.getWithKeysRLocked(ctx, t, scope, logicalKey, beKey, backend.Unbounded)
-		if err != nil {
-			return nil, err
-		}
-		if off+n > int64(len(full)) {
-			return nil, fmt.Errorf("most: range %d+%d outside %s (%d bytes)", off, n, logicalKey, len(full))
-		}
-		return append([]byte(nil), full[off:off+n]...), nil
+	// Verify full immutable object through manifest digest and serve slice cleanly from verified cache.
+	full, _, err := e.getWithKeysRLocked(ctx, t, scope, logicalKey, beKey, backend.Unbounded)
+	if err != nil {
+		return nil, err
 	}
-
-	// Otherwise cache at range-block granularity (e.g., individual chunks inside a 16 MiB pack).
-	start := time.Now()
-	e.totalReads.Add(1)
-	t.reads.Add(1)
-
-	rangeKey := fmt.Sprintf("%s#%d+%d", logicalKey, off, n)
-	rck := cacheKey{scope: ScopeSharedImmutable, key: rangeKey}
-
-	if b, _, ok, err := e.tryRAMHit(t, rck, backend.Unbounded); ok || err != nil {
-		dur := time.Since(start)
-		e.latencies.record(dur)
-		t.latencies.record(dur)
-		return b, err
+	if off+n > int64(len(full)) {
+		return nil, fmt.Errorf("most: range %d+%d outside %s (%d bytes)", off, n, logicalKey, len(full))
 	}
-	if b, _, ok, err := e.tryNVMeRead(t, rck, nil, backend.Unbounded); ok || err != nil {
-		dur := time.Since(start)
-		e.latencies.record(dur)
-		t.latencies.record(dur)
-		return b, err
-	}
-
-	fk := rck.hotKey() + "\x00" + beKey
-	plain, _, err := e.flights.do(ctx, fk, func() ([]byte, backend.Version, error) {
-		if rb, rver, rok, rerr := e.tryRAMHit(t, rck, backend.Unbounded); rok || rerr != nil {
-			return rb, rver, rerr
-		}
-		if nb, nver, nok, nerr := e.tryNVMeRead(t, rck, nil, backend.Unbounded); nok || nerr != nil {
-			return nb, nver, nerr
-		}
-		e.backendGets.Add(1)
-		t.backendGets.Add(1)
-		raw, err := e.be.GetRange(ctx, beKey, off, n)
-		if err != nil {
-			return nil, "", err
-		}
-		digest := blake3.Sum(raw)
-		if err := e.verifyAndPinSharedDigest(rangeKey, digest); err != nil {
-			e.integrityErrs.Add(1)
-			return nil, "", err
-		}
-		frame := encodeSharedFrame(digest, raw)
-		if err := e.admitOnMiss(t, rck, nil, raw, frame, digest, ""); err != nil {
-			return nil, "", err
-		}
-		return raw, "", nil
-	})
-	dur := time.Since(start)
-	e.latencies.record(dur)
-	t.latencies.record(dur)
-	return plain, err
+	return append([]byte(nil), full[off:off+n]...), nil
 }
 
-func (e *Engine) verifyAndPinSharedDigest(key string, sum [blake3.Size]byte) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if expected, ok := e.sharedDigests[key]; ok {
-		if expected != sum {
-			return fmt.Errorf("%w: shared key %s digest mismatch", ErrIntegrityViolation, key)
-		}
-		return nil
-	}
-	e.sharedDigests[key] = sum
-	return nil
-}
-
-func (e *Engine) tryRAMHit(t *tenantState, ck cacheKey, max int64) ([]byte, backend.Version, bool, error) {
+func (e *Engine) tryRAMHit(t *tenantState, reqScope Scope, ck cacheKey, sharedMeta sharedKeyMeta, max int64) ([]byte, backend.Version, bool, error) {
 	now := e.cfg.Clock()
 	e.mu.Lock()
-	if err := e.authorizeLocked(t, ck.scope, ck.key); err != nil {
+	if err := e.authorizeLocked(t, reqScope, ck.key); err != nil {
 		e.mu.Unlock()
 		e.unauthAttempts.Add(1)
 		return nil, "", false, err
+	}
+	if reqScope.isImmutableShared() {
+		if err := e.authorizeSharedKeyLocked(t, reqScope, ck.key, sharedMeta); err != nil {
+			e.mu.Unlock()
+			e.unauthAttempts.Add(1)
+			return nil, "", false, err
+		}
 	}
 	re, ok := e.ramEntries[ck]
 	if !ok {
 		e.mu.Unlock()
 		return nil, "", false, nil
+	}
+	if reqScope.isImmutableShared() && subtle.ConstantTimeCompare(re.digest[:], sharedMeta.digest[:]) != 1 {
+		e.mu.Unlock()
+		e.integrityErrs.Add(1)
+		return nil, "", false, fmt.Errorf("%w: cached RAM shared digest mismatch for %s", ErrIntegrityViolation, ck.key)
 	}
 	// Tenants with quotaRAM == 0 do not read through RAM tier.
 	qRAM := e.effectiveQuotaRAM(t)
@@ -841,7 +1272,7 @@ func (e *Engine) tryRAMHit(t *tenantState, ck cacheKey, max int64) ([]byte, back
 		e.ramHits.Add(1)
 		t.ramHits.Add(1)
 		return cp, ver, true, nil
-	} else if ck.scope == ScopeSharedImmutable {
+	} else if ck.scope.isImmutableShared() {
 		// Attach authorized tenant as a holder under its own quota (deduped physical RAM).
 		demote := e.evictRAMForTenantLocked(t, re.cost)
 		if t.ramUsed+re.cost <= qRAM {
@@ -865,16 +1296,24 @@ func (e *Engine) tryRAMHit(t *tenantState, ck cacheKey, max int64) ([]byte, back
 	}
 }
 
-func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64) ([]byte, backend.Version, bool, error) {
+func (e *Engine) tryNVMeRead(t *tenantState, reqScope Scope, ck cacheKey, ciph Cipher, sharedMeta sharedKeyMeta, max int64) ([]byte, backend.Version, bool, error) {
 	kl := e.keyShard(ck)
 	kl.Lock()
 
 	e.mu.RLock()
-	if err := e.authorizeLocked(t, ck.scope, ck.key); err != nil {
+	if err := e.authorizeLocked(t, reqScope, ck.key); err != nil {
 		e.mu.RUnlock()
 		kl.Unlock()
 		e.unauthAttempts.Add(1)
 		return nil, "", false, err
+	}
+	if reqScope.isImmutableShared() {
+		if err := e.authorizeSharedKeyLocked(t, reqScope, ck.key, sharedMeta); err != nil {
+			e.mu.RUnlock()
+			kl.Unlock()
+			e.unauthAttempts.Add(1)
+			return nil, "", false, err
+		}
 	}
 	ne, ok := e.nvmeEntries[ck]
 	if !ok {
@@ -883,7 +1322,7 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 		return nil, "", false, nil
 	}
 	diskPath := filepath.Join(e.cfg.NVMeDir, ne.relPath)
-	expectedDigest := ne.digest
+	artID := ne.artifactID
 	ver := ne.ver
 	volID := t.volID
 	e.mu.RUnlock()
@@ -898,6 +1337,7 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 	}
 
 	var plain []byte
+	var expectedDigest [blake3.Size]byte
 	if ck.scope == ScopePrivate {
 		plain, err = unsealPrivate(ciph, t.id, volID, ck.key, frame)
 		if err != nil {
@@ -906,18 +1346,21 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 			return nil, "", false, err
 		}
 	} else {
-		e.mu.RLock()
-		pinned, hasPinned := e.sharedDigests[ck.key]
-		e.mu.RUnlock()
-		want := expectedDigest
-		if hasPinned {
-			want = pinned
+		expectedDigest = sharedMeta.digest
+		if artID == "" {
+			artID = sharedMeta.artifactID
 		}
-		plain, err = decodeSharedFrame(frame, want)
+		plain, err = unsealSharedFrame(e.hostCipher, artID, ck.key, expectedDigest, frame)
 		if err != nil {
 			kl.Unlock()
 			e.integrityErrs.Add(1)
 			return nil, "", false, err
+		}
+		if int64(len(plain)) != sharedMeta.size {
+			kl.Unlock()
+			clear(plain)
+			e.integrityErrs.Add(1)
+			return nil, "", false, fmt.Errorf("%w: shared NVMe block %s size %d != manifest size %d", ErrIntegrityViolation, ck.key, len(plain), sharedMeta.size)
 		}
 	}
 
@@ -933,12 +1376,21 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 	var evPaths []string
 
 	e.mu.Lock()
-	if err := e.authorizeLocked(t, ck.scope, ck.key); err != nil {
+	if err := e.authorizeLocked(t, reqScope, ck.key); err != nil {
 		e.mu.Unlock()
 		kl.Unlock()
 		clear(plain)
 		e.unauthAttempts.Add(1)
 		return nil, "", false, err
+	}
+	if reqScope.isImmutableShared() {
+		if err := e.authorizeSharedKeyLocked(t, reqScope, ck.key, sharedMeta); err != nil {
+			e.mu.Unlock()
+			kl.Unlock()
+			clear(plain)
+			e.unauthAttempts.Add(1)
+			return nil, "", false, err
+		}
 	}
 	e.nvmeHits.Add(1)
 	t.nvmeHits.Add(1)
@@ -949,7 +1401,7 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 	if stillNVMe {
 		if el, held := ne.holders[t.id]; held {
 			t.nvmeLRU.MoveToFront(el)
-		} else if ck.scope == ScopeSharedImmutable {
+		} else if ck.scope.isImmutableShared() {
 			qNVMe := e.effectiveQuotaNVMe(t)
 			if qNVMe != 0 && ne.cost <= qNVMe {
 				evPaths = e.evictNVMeForTenantLocked(t, ne.cost)
@@ -966,7 +1418,7 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 		// Selective mirroring: promote to RAM ONLY if score >= HotThreshold,
 		// leaving the NVMe copy completely intact (zero demotion writes).
 		if score >= e.cfg.HotThreshold {
-			if e.admitRAMLocked(t, ck, plain, expectedDigest, ver) {
+			if e.admitRAMLocked(t, ck, artID, plain, expectedDigest, ver) {
 				e.mirrorPromotes.Add(1)
 				t.mirrorPromotes.Add(1)
 			}
@@ -977,7 +1429,7 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 			if stillNVMe {
 				removeNVMePath = e.removeNVMeEntryLocked(ck)
 			}
-			demote, _ = e.admitRAMWithDemoteLocked(t, ck, plain, expectedDigest, ver)
+			demote, _ = e.admitRAMWithDemoteLocked(t, ck, artID, plain, expectedDigest, ver)
 		}
 	}
 	e.mu.Unlock()
@@ -998,12 +1450,12 @@ func (e *Engine) tryNVMeRead(t *tenantState, ck cacheKey, ciph Cipher, max int64
 	return plain, ver, true, nil
 }
 
-func (e *Engine) admitOnMiss(t *tenantState, ck cacheKey, ciph Cipher, plain, diskFrame []byte, digest [blake3.Size]byte, ver backend.Version) error {
+func (e *Engine) admitOnMiss(t *tenantState, reqScope Scope, ck cacheKey, artifactID string, plain, diskFrame []byte, digest [blake3.Size]byte, ver backend.Version) error {
 	now := e.cfg.Clock()
 	cost := int64(len(plain))
 
 	e.mu.Lock()
-	if err := e.authorizeLocked(t, ck.scope, ck.key); err != nil {
+	if err := e.authorizeLocked(t, reqScope, ck.key); err != nil {
 		e.mu.Unlock()
 		e.unauthAttempts.Add(1)
 		return err
@@ -1016,19 +1468,19 @@ func (e *Engine) admitOnMiss(t *tenantState, ck cacheKey, ciph Cipher, plain, di
 		// Only admit to RAM immediately if score already >= HotThreshold (e.g. threshold <= 1).
 		mirrorRAM := score >= e.cfg.HotThreshold
 		if mirrorRAM {
-			if e.admitRAMLocked(t, ck, plain, digest, ver) {
+			if e.admitRAMLocked(t, ck, artifactID, plain, digest, ver) {
 				e.mirrorPromotes.Add(1)
 				t.mirrorPromotes.Add(1)
 			}
 		}
 		e.mu.Unlock()
-		return e.writeNVMe(t, ck, diskFrame, cost, digest, ver)
+		return e.writeNVMe(t, ck, artifactID, diskFrame, cost, digest, ver)
 
 	case PolicyTierMigration:
 		// Baseline exclusive tier migration: cold misses enter RAM immediately,
 		// demoting evicted RAM items down to NVMe (write amplification).
 		if e.effectiveQuotaRAM(t) > 0 && cost <= e.effectiveQuotaRAM(t) && (e.cfg.TotalRAMBytes == 0 || cost <= e.cfg.TotalRAMBytes) {
-			demote, _ := e.admitRAMWithDemoteLocked(t, ck, plain, digest, ver)
+			demote, _ := e.admitRAMWithDemoteLocked(t, ck, artifactID, plain, digest, ver)
 			e.mu.Unlock()
 			if len(demote) > 0 {
 				e.executeDemotions(demote)
@@ -1036,31 +1488,32 @@ func (e *Engine) admitOnMiss(t *tenantState, ck cacheKey, ciph Cipher, plain, di
 			return nil
 		}
 		e.mu.Unlock()
-		return e.writeNVMe(t, ck, diskFrame, cost, digest, ver)
+		return e.writeNVMe(t, ck, artifactID, diskFrame, cost, digest, ver)
 	}
 	e.mu.Unlock()
 	return nil
 }
 
 type demoteJob struct {
-	ck     cacheKey
-	plain  []byte
-	cost   int64
-	digest [blake3.Size]byte
-	ver    backend.Version
-	tenant *tenantState
+	ck         cacheKey
+	artifactID string
+	plain      []byte
+	cost       int64
+	digest     [blake3.Size]byte
+	ver        backend.Version
+	tenant     *tenantState
 }
 
-func (e *Engine) admitRAMLocked(t *tenantState, ck cacheKey, plain []byte, digest [blake3.Size]byte, ver backend.Version) bool {
-	_, promoted := e.admitRAMInternalLocked(t, ck, plain, digest, ver, false)
+func (e *Engine) admitRAMLocked(t *tenantState, ck cacheKey, artifactID string, plain []byte, digest [blake3.Size]byte, ver backend.Version) bool {
+	_, promoted := e.admitRAMInternalLocked(t, ck, artifactID, plain, digest, ver, false)
 	return promoted
 }
 
-func (e *Engine) admitRAMWithDemoteLocked(t *tenantState, ck cacheKey, plain []byte, digest [blake3.Size]byte, ver backend.Version) ([]demoteJob, bool) {
-	return e.admitRAMInternalLocked(t, ck, plain, digest, ver, true)
+func (e *Engine) admitRAMWithDemoteLocked(t *tenantState, ck cacheKey, artifactID string, plain []byte, digest [blake3.Size]byte, ver backend.Version) ([]demoteJob, bool) {
+	return e.admitRAMInternalLocked(t, ck, artifactID, plain, digest, ver, true)
 }
 
-func (e *Engine) admitRAMInternalLocked(t *tenantState, ck cacheKey, plain []byte, digest [blake3.Size]byte, ver backend.Version, collectDemote bool) ([]demoteJob, bool) {
+func (e *Engine) admitRAMInternalLocked(t *tenantState, ck cacheKey, artifactID string, plain []byte, digest [blake3.Size]byte, ver backend.Version, collectDemote bool) ([]demoteJob, bool) {
 	cost := int64(len(plain))
 	qRAM := e.effectiveQuotaRAM(t)
 	if qRAM == 0 || cost > qRAM || (e.cfg.TotalRAMBytes > 0 && cost > e.cfg.TotalRAMBytes) {
@@ -1103,12 +1556,13 @@ func (e *Engine) admitRAMInternalLocked(t *tenantState, ck cacheKey, plain []byt
 	}
 
 	re := &ramEntry{
-		id:      ck,
-		plain:   append([]byte(nil), plain...),
-		cost:    cost,
-		ver:     ver,
-		digest:  digest,
-		holders: map[string]*list.Element{},
+		id:         ck,
+		artifactID: artifactID,
+		plain:      append([]byte(nil), plain...),
+		cost:       cost,
+		ver:        ver,
+		digest:     digest,
+		holders:    map[string]*list.Element{},
 	}
 	re.holders[t.id] = t.ramLRU.PushFront(ck)
 	e.ramEntries[ck] = re
@@ -1200,12 +1654,13 @@ func (e *Engine) evictOneRAMLocked(t *tenantState, collectDemote bool) []demoteJ
 			}
 		}
 		job := demoteJob{
-			ck:     ck,
-			plain:  re.plain,
-			cost:   re.cost,
-			digest: re.digest,
-			ver:    re.ver,
-			tenant: owner,
+			ck:         ck,
+			artifactID: re.artifactID,
+			plain:      re.plain,
+			cost:       re.cost,
+			digest:     re.digest,
+			ver:        re.ver,
+			tenant:     owner,
 		}
 		re.plain = nil
 		return []demoteJob{job}
@@ -1223,26 +1678,32 @@ func (e *Engine) executeDemotions(demotes []demoteJob) {
 		var frame []byte
 		var err error
 		if j.ck.scope == ScopePrivate {
-			if j.tenant != nil && !j.tenant.revoked && j.tenant.cipher != nil {
-				frame, err = sealPrivate(j.tenant.cipher, j.ck.tenant, j.ck.volID, j.ck.key, j.plain)
+			if j.tenant != nil {
+				e.mu.RLock()
+				rev := j.tenant.revoked
+				ciph := j.tenant.cipher
+				e.mu.RUnlock()
+				if !rev && ciph != nil {
+					frame, err = sealPrivate(ciph, j.ck.tenant, j.ck.volID, j.ck.key, j.plain)
+				}
 			}
 		} else {
 			sum := blake3.Sum(j.plain)
 			j.digest = sum
-			frame = encodeSharedFrame(sum, j.plain)
+			frame, err = sealSharedFrame(e.hostCipher, j.artifactID, j.ck.key, sum, j.plain)
 		}
 		clear(j.plain)
 		if err != nil || frame == nil || j.tenant == nil {
 			continue
 		}
-		if werr := e.writeNVMe(j.tenant, j.ck, frame, j.cost, j.digest, j.ver); werr == nil {
+		if werr := e.writeNVMe(j.tenant, j.ck, j.artifactID, frame, j.cost, j.digest, j.ver); werr == nil {
 			e.migrationWrite.Add(1)
 			j.tenant.migrationWrite.Add(1)
 		}
 	}
 }
 
-func (e *Engine) writeNVMe(t *tenantState, ck cacheKey, diskFrame []byte, logicalCost int64, digest [blake3.Size]byte, ver backend.Version) error {
+func (e *Engine) writeNVMe(t *tenantState, ck cacheKey, artifactID string, diskFrame []byte, logicalCost int64, digest [blake3.Size]byte, ver backend.Version) error {
 	qNVMe := e.effectiveQuotaNVMe(t)
 	if qNVMe == 0 || logicalCost > qNVMe || (e.cfg.TotalNVMeBytes > 0 && logicalCost > e.cfg.TotalNVMeBytes) {
 		return nil
@@ -1301,6 +1762,7 @@ func (e *Engine) writeNVMe(t *tenantState, ck cacheKey, diskFrame []byte, logica
 		return ErrTenantUnauthorized
 	}
 	if existing, ok := e.nvmeEntries[ck]; ok {
+		existing.artifactID = artifactID
 		existing.digest = digest
 		existing.ver = ver
 		if el, held := existing.holders[t.id]; held {
@@ -1357,13 +1819,14 @@ func (e *Engine) writeNVMe(t *tenantState, ck cacheKey, diskFrame []byte, logica
 	}
 
 	ne := &nvmeEntry{
-		id:       ck,
-		relPath:  rel,
-		cost:     logicalCost,
-		ver:      ver,
-		digest:   digest,
-		holders:  map[string]*list.Element{},
-		isShared: ck.scope == ScopeSharedImmutable,
+		id:         ck,
+		artifactID: artifactID,
+		relPath:    rel,
+		cost:       logicalCost,
+		ver:        ver,
+		digest:     digest,
+		holders:    map[string]*list.Element{},
+		isShared:   ck.scope.isImmutableShared(),
 	}
 	ne.holders[t.id] = t.nvmeLRU.PushFront(ck)
 	e.nvmeEntries[ck] = ne
@@ -1457,9 +1920,9 @@ func (e *Engine) invalidateLocked(ck cacheKey) string {
 }
 
 // Put seals and writes private data for tenantID. Writing to ScopeSharedImmutable
-// fails closed with ErrReadOnly.
+// or ScopePublicImmutable fails closed with ErrReadOnly.
 func (e *Engine) Put(ctx context.Context, tenantID string, scope Scope, key string, data []byte) error {
-	if scope == ScopeSharedImmutable {
+	if scope.isImmutableShared() {
 		e.unauthAttempts.Add(1)
 		return ErrReadOnly
 	}
@@ -1472,7 +1935,7 @@ func (e *Engine) Put(ctx context.Context, tenantID string, scope Scope, key stri
 }
 
 func (e *Engine) putForBackend(ctx context.Context, tenantID string, scope Scope, logicalKey, beKey string, data []byte) error {
-	if scope == ScopeSharedImmutable {
+	if scope.isImmutableShared() {
 		e.unauthAttempts.Add(1)
 		return ErrReadOnly
 	}
@@ -1513,23 +1976,21 @@ func (e *Engine) putWithKeys(ctx context.Context, t *tenantState, scope Scope, l
 	if err != nil {
 		return err
 	}
-	if err := e.be.Put(ctx, beKey, sealed); err != nil {
-		return err
-	}
 
 	ck := cacheKey{scope: ScopePrivate, tenant: t.id, volID: volID, key: logicalKey}
 	kl := e.keyShard(ck)
 	kl.Lock()
+	defer kl.Unlock()
+
+	if err := e.be.Put(ctx, beKey, sealed); err != nil {
+		return err
+	}
 	e.mu.Lock()
 	remPath := e.invalidateLocked(ck)
 	e.mu.Unlock()
 	if remPath != "" {
 		_ = os.Remove(remPath)
 	}
-	kl.Unlock()
-
-	// Write-through to backend and invalidate any stale cache entry so subsequent
-	// Get calls fetch the authoritative backend Version cleanly.
 	return nil
 }
 
@@ -1542,7 +2003,7 @@ func (e *Engine) putIfVersionForBackend(ctx context.Context, tenantID string, sc
 }
 
 func (e *Engine) putConditionalForBackend(ctx context.Context, tenantID string, scope Scope, logicalKey, beKey string, data []byte, v backend.Version, absent bool) (backend.Version, error) {
-	if scope == ScopeSharedImmutable {
+	if scope.isImmutableShared() {
 		e.unauthAttempts.Add(1)
 		return "", ErrReadOnly
 	}
@@ -1573,33 +2034,36 @@ func (e *Engine) putConditionalForBackend(ctx context.Context, tenantID string, 
 	if err != nil {
 		return "", err
 	}
+
+	ck := cacheKey{scope: ScopePrivate, tenant: t.id, volID: volID, key: logicalKey}
+	kl := e.keyShard(ck)
+	kl.Lock()
+	defer kl.Unlock()
+
 	var newVer backend.Version
 	if absent {
 		newVer, err = e.be.PutIfAbsent(ctx, beKey, sealed)
 	} else {
 		newVer, err = e.be.PutIfVersion(ctx, beKey, sealed, v)
 	}
-	ck := cacheKey{scope: ScopePrivate, tenant: t.id, volID: volID, key: logicalKey}
-	kl := e.keyShard(ck)
-	kl.Lock()
+	// Always invalidate cached RAM/NVMe under the shard lock so neither winning
+	// nor losing CAS callers can ever observe or leave behind a stale version.
 	e.mu.Lock()
 	remPath := e.invalidateLocked(ck)
 	e.mu.Unlock()
 	if remPath != "" {
 		_ = os.Remove(remPath)
 	}
-	kl.Unlock()
 	if err != nil {
 		return "", err
 	}
-	_ = e.writeNVMe(t, ck, sealed, int64(len(data)), [blake3.Size]byte{}, newVer)
 	return newVer, nil
 }
 
 // Delete removes a private object from cache and underlying backend. Deleting
-// from ScopeSharedImmutable fails closed with ErrReadOnly.
+// from ScopeSharedImmutable or ScopePublicImmutable fails closed with ErrReadOnly.
 func (e *Engine) Delete(ctx context.Context, tenantID string, scope Scope, key string) error {
-	if scope == ScopeSharedImmutable {
+	if scope.isImmutableShared() {
 		e.unauthAttempts.Add(1)
 		return ErrReadOnly
 	}
@@ -1612,7 +2076,7 @@ func (e *Engine) Delete(ctx context.Context, tenantID string, scope Scope, key s
 }
 
 func (e *Engine) deleteForBackend(ctx context.Context, tenantID string, scope Scope, logicalKey, beKey string) error {
-	if scope == ScopeSharedImmutable {
+	if scope.isImmutableShared() {
 		e.unauthAttempts.Add(1)
 		return ErrReadOnly
 	}
@@ -1640,6 +2104,7 @@ func (e *Engine) deleteWithKeys(ctx context.Context, t *tenantState, scope Scope
 		ck := cacheKey{scope: ScopePrivate, tenant: t.id, volID: volID, key: logicalKey}
 		kl := e.keyShard(ck)
 		kl.Lock()
+		defer kl.Unlock()
 		e.mu.Lock()
 		remPath := e.invalidateLocked(ck)
 		e.hot.forget(ck.hotKey())
@@ -1647,7 +2112,6 @@ func (e *Engine) deleteWithKeys(ctx context.Context, t *tenantState, scope Scope
 		if remPath != "" {
 			_ = os.Remove(remPath)
 		}
-		kl.Unlock()
 	}
 	return e.be.Delete(ctx, beKey)
 }
@@ -1661,8 +2125,11 @@ func (e *Engine) Stat(ctx context.Context, tenantID string, scope Scope, key str
 	var beKey string
 	if scope == ScopePrivate {
 		beKey = e.privateEngineBackendKey(t.tvHash, key)
-	} else {
+	} else if scope.isImmutableShared() {
 		beKey = e.sharedBackendKey(key)
+	} else {
+		e.unauthAttempts.Add(1)
+		return 0, ErrTenantUnauthorized
 	}
 	return e.statForBackend(ctx, tenantID, scope, key, beKey)
 }
@@ -1675,15 +2142,19 @@ func (e *Engine) statForBackend(ctx context.Context, tenantID string, scope Scop
 	t.lifecycleMu.RLock()
 	defer t.lifecycleMu.RUnlock()
 
+	if scope.isImmutableShared() {
+		meta, err := e.lookupSharedMeta(t, scope, logicalKey)
+		if err != nil {
+			return 0, err
+		}
+		return meta.size, nil
+	}
+
 	e.mu.RLock()
 	authErr := e.authorizeLocked(t, scope, logicalKey)
 	volID := t.volID
-	if authErr == nil && !(scope == ScopePrivate && logicalKey == "head") {
-		ck := cacheKey{scope: scope, key: logicalKey}
-		if scope == ScopePrivate {
-			ck.tenant = t.id
-			ck.volID = volID
-		}
+	if authErr == nil && logicalKey != "head" {
+		ck := cacheKey{scope: ScopePrivate, tenant: t.id, volID: volID, key: logicalKey}
 		if re, ok := e.ramEntries[ck]; ok {
 			cost := re.cost
 			e.mu.RUnlock()
@@ -1700,7 +2171,7 @@ func (e *Engine) statForBackend(ctx context.Context, tenantID string, scope Scop
 		e.unauthAttempts.Add(1)
 		return 0, authErr
 	}
-	if scope == ScopeSharedImmutable || logicalKey == "head" {
+	if logicalKey == "head" {
 		return e.be.Stat(ctx, beKey)
 	}
 	b, _, err := e.getWithKeysRLocked(ctx, t, scope, logicalKey, beKey, backend.Unbounded)
@@ -1715,7 +2186,7 @@ func (e *Engine) HotnessScore(tenantID string, scope Scope, key string) float64 
 	now := e.cfg.Clock()
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	ck := cacheKey{scope: scope, key: key}
+	ck := cacheKey{scope: canonicalCacheScope(scope), key: key}
 	if scope == ScopePrivate {
 		t := e.tenants[tenantID]
 		if t == nil {
@@ -1848,3 +2319,6 @@ func (e *Engine) SnapshotLatencies() []time.Duration {
 	}
 	return out
 }
+
+// Unused import guard for bytes in case future builds trim helpers.
+var _ = bytes.Equal

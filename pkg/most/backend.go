@@ -14,6 +14,8 @@ import (
 	"github.com/hanzoai/vfs/pkg/backend"
 )
 
+const manifestKeyDir = "manifests/"
+
 // BackendOption customizes a TenantBackend view over an Engine.
 type BackendOption func(*tenantBackendConfig)
 
@@ -21,8 +23,8 @@ type tenantBackendConfig struct {
 	scope Scope
 }
 
-// WithScope configures the TenantBackend to serve ScopePrivate (default) or
-// read-only ScopeSharedImmutable.
+// WithScope configures the TenantBackend to serve ScopePrivate (default),
+// read-only ScopeSharedImmutable, or read-only ScopePublicImmutable.
 func WithScope(s Scope) BackendOption {
 	return func(c *tenantBackendConfig) {
 		c.scope = s
@@ -66,6 +68,13 @@ func NewSharedBackend(e *Engine, tenantID string, opts ...BackendOption) *Tenant
 	return NewTenantBackend(e, tenantID, all...)
 }
 
+// NewPublicBackend returns a read-only backend.Backend view over engine's
+// explicitly public ScopePublicImmutable toolchain tier for tenantID.
+func NewPublicBackend(e *Engine, tenantID string, opts ...BackendOption) *TenantBackend {
+	all := append([]BackendOption{WithScope(ScopePublicImmutable)}, opts...)
+	return NewTenantBackend(e, tenantID, all...)
+}
+
 func (tb *TenantBackend) checkOpen() error {
 	if tb == nil || tb.engine == nil {
 		return ErrTenantUnauthorized
@@ -83,11 +92,17 @@ func (tb *TenantBackend) mapKeys(key string) (string, error) {
 	if err := tb.checkOpen(); err != nil {
 		return "", err
 	}
+	if tb.scope.isImmutableShared() {
+		if key == "" {
+			return "", backend.ErrKey
+		}
+		if err := backend.ValidPrefix(key); err != nil {
+			return "", fmt.Errorf("%w: %v", backend.ErrKey, err)
+		}
+		return tb.engine.sharedBackendKey(key), nil
+	}
 	if err := backend.ValidKey(key); err != nil {
 		return "", err
-	}
-	if tb.scope == ScopeSharedImmutable {
-		return tb.engine.sharedBackendKey(key), nil
 	}
 	t, err := tb.engine.getTenant(tb.tenantID)
 	if err != nil {
@@ -103,7 +118,7 @@ func (tb *TenantBackend) mapPrefix(prefix string) (basePrefix, fullPrefix string
 	if err := backend.ValidKeyPrefix(prefix); err != nil {
 		return "", "", err
 	}
-	if tb.scope == ScopeSharedImmutable {
+	if tb.scope.isImmutableShared() {
 		if tb.engine.cfg.SharedPrefix == "" {
 			return "", prefix, nil
 		}
@@ -188,7 +203,7 @@ func (tb *TenantBackend) List(ctx context.Context, prefix string) (<-chan backen
 	tb.engine.mu.RLock()
 	authErr := tb.engine.authorizeLocked(t, tb.scope, prefix)
 	tb.engine.mu.RUnlock()
-	if authErr != nil && !(tb.scope == ScopeSharedImmutable && t.sharedAllowed) {
+	if authErr != nil && !(tb.scope.isImmutableShared() && t.sharedAllowed) {
 		t.lifecycleMu.RUnlock()
 		tb.engine.unauthAttempts.Add(1)
 		errCh <- authErr
@@ -204,8 +219,17 @@ func (tb *TenantBackend) List(ctx context.Context, prefix string) (<-chan backen
 		defer close(errCh)
 		for o := range rawObjs {
 			k := strings.TrimPrefix(o.Key, bp)
-			if tb.scope == ScopeSharedImmutable && !t.allowsShared(k) {
+			if strings.HasPrefix(k, manifestKeyDir) {
 				continue
+			}
+			if tb.scope.isImmutableShared() {
+				tb.engine.mu.RLock()
+				meta, reg := tb.engine.sharedMeta[k]
+				allowed := reg && tb.engine.authorizeSharedKeyLocked(t, tb.scope, k, meta) == nil
+				tb.engine.mu.RUnlock()
+				if !allowed {
+					continue
+				}
 			}
 			o.Key = k
 			objs <- o
@@ -241,7 +265,7 @@ func (tb *TenantBackend) String() string {
 		return "most://invalid"
 	}
 	base := strings.TrimRight(tb.engine.be.String(), "/")
-	if tb.scope == ScopeSharedImmutable {
+	if tb.scope.isImmutableShared() {
 		if tb.engine.cfg.SharedPrefix != "" {
 			return base + "/" + tb.engine.cfg.SharedPrefix
 		}

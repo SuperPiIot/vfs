@@ -41,9 +41,12 @@ tier (`vfs -> most.TenantBackend -> hanzoai/s3` inside `visor`):
    `backend.Backend` and managing:
    * `ramPool`: byte-bounded host RAM pool with per-tenant LRU queues and
      deduplicated read-only sharing for `ScopeSharedImmutable`.
-   * `nvmeTier`: disk-backed directory cache (`NVMeDir`) storing only sealed
-     `ScopePrivate` frames or BLAKE3-verified `ScopeSharedImmutable` frames
+   * `nvmeTier`: disk-backed directory cache (`NVMeDir`) storing **only**
+     ciphertext-sealed frames (`ScopePrivate` sealed with the per-tenant `Cipher`;
+     `ScopeSharedImmutable` and `ScopePublicImmutable` sealed at rest with
+     `HostCacheCipher` and domain-separated AAD `["most-shared-v2" | artifactID | key | expectedDigestHex]`)
      under content-hashed paths (`priv/<tenantHash>/...` and `shared/...`).
+     Zero plaintext ever touches disk in any scope.
 2. **Selective mirroring vs ordinary tier migration:**
    * **`PolicyTierMigration` (Baseline):** Exclusive tiering. Cold misses enter
      RAM directly; RAM eviction demotes victims to NVMe (`TierMigrationWrites`);
@@ -56,21 +59,37 @@ tier (`vfs -> most.TenantBackend -> hanzoai/s3` inside `visor`):
      reaching `HotThreshold` are **mirrored** into `ramPool` while keeping their
      NVMe copy intact, so RAM eviction drops and zeros the RAM buffer with
      **zero demotion write-back** (`TierMigrationWrites == 0`).
-3. **Fail-closed security & tenant isolation (`Cipher` + `BLAKE3` + `RevokeTenant`):**
+3. **Fail-closed security, authenticated manifests & tenant isolation (`Cipher` + `ArtifactManifest` + `PutIfAbsent` + `RevokeTenant`):**
    * `most.Cipher` matches `vfs.Cipher` structurally (`Seal`/`Open`) with zero
      circular import on package `vfs`, so `vfs.Hybrid(...)` plugs in directly.
+     Every configured `Cipher` (`HostCacheCipher`, `SharedManifestCipher`, and
+     each tenant `Cipher`) is self-checked via `checkCipher` on registration,
+     refusing nil, non-authenticating, or plaintext/identity ciphers (`ErrBadCipher`).
    * Unregistered/revoked tenants or `ScopePrivate` requests without a cipher
      fail closed with `ErrTenantUnauthorized`.
    * Private payloads are sealed with an injective 32-byte length-framed BLAKE3
-     AAD context `[tenantID | volID | key]` before `cipher.Seal(...)`; cross-tenant,
-     cross-volume, or cross-key ciphertext swaps fail closed with
+     AAD context `["private" | tenantID | volID | key]` before `cipher.Seal(...)`;
+     cross-tenant, cross-volume, or cross-key ciphertext swaps fail closed with
      `ErrIntegrityViolation`.
-   * `ScopeSharedImmutable` verifies `SetSharedAccess` ACLs and pinned `BLAKE3`
-     digests on every backend fetch, NVMe read, and RAM promotion (`ErrReadOnly`
-     on tenant mutation attempts; `ErrIntegrityViolation` on digest mismatch).
-   * `RevokeTenant(tenantID)` immediately zeros (`clear`) and purges all RAM
-     buffers, removes all tenant private NVMe files from disk, and detaches
-     shared references without disturbing healthy tenants.
+   * **Independently authenticated immutable manifests & zero TOFU:**
+     `ScopeSharedImmutable` (ACL-gated shared toolchains) and `ScopePublicImmutable`
+     (explicitly public read-only toolchains) require every `(key -> BLAKE3 digest, size)`
+     entry to be registered via an `ArtifactManifest` sealed with `SharedManifestCipher`
+     under domain-separated AAD `["most-manifest-v1" | artifactID]`. Reading any
+     unregistered shared or public key fails closed immediately with
+     `ErrUnregisteredArtifact` (zero Trust-On-First-Use).
+   * **Conditional immutable publish (`PutIfAbsent`):** `PublishSharedArtifact`,
+     `PublishPublicArtifact`, and `PublishSharedObject` publish both objects and
+     sealed manifests strictly via `backend.PutIfAbsent`. Concurrent or retry
+     publishes of identical content succeed idempotently, whereas any attempt to
+     replace an existing key or manifest ID with different content fails closed
+     with `ErrImmutableConflict`. Cold restarts recover verified manifest state
+     via `LoadArtifactManifest(ctx, artifactID, manifestCipher)` without TOFU.
+   * `SetSharedAccess(tenantID, allowed, prefixes...)` and `RevokeTenant(tenantID)`
+     take effect immediately across both RAM-hot and NVMe-warm entries:
+     `RevokeTenant` zeros (`clear`) and purges all RAM buffers, removes all
+     tenant private NVMe files from disk, and detaches shared references without
+     disturbing healthy tenants.
 
 ## 3. Falsifiable hypotheses and matched baselines
 
@@ -116,20 +135,22 @@ have `0.0 ms` injected delay. Raw data is in [`docs/most.csv`](./most.csv).
 
 | Workload | System | Delay (ms) | Ops | Wall (ms) | P50 (us) | P95 (us) | P99 (us) | Backend GETs | RAM Hits | NVMe Hits | Promotions | Demotion Writes | Res RAM (KiB) | Res NVMe (KiB) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `zipf_shared_toolchain_unthrottled` | `no_cache` | 0.0 | 2400 | 66.22 | 22.9 | 698.2 | 1154.5 | 2400 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
-| `zipf_shared_toolchain_unthrottled` | `tier_migration` | 0.0 | 2400 | 1236.01 | 7.0 | 909.9 | 13978.0 | 421 | 1382 | 593 | 0 | 990 | 192.0 | 3136.0 |
-| `zipf_shared_toolchain_unthrottled` | **`most_selective_mirror`** | 0.0 | 2400 | **87.56** | **5.5** | **456.8** | **2030.1** | **416** | **1492** | 489 | 489 | **0** | 192.0 | 3328.0 |
-| `zipf_shared_toolchain_sim2ms` | `no_cache` | 2.0 | 480 | 293.70 | 2371.8 | 2956.5 | 4000.0 | 480 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
-| `zipf_shared_toolchain_sim2ms` | `tier_migration` | 2.0 | 480 | 169.64 | 271.5 | 3417.3 | 4051.0 | 190 | 201 | 85 | 0 | 251 | 192.0 | 1320.0 |
-| `zipf_shared_toolchain_sim2ms` | **`most_selective_mirror`** | 2.0 | 480 | **149.51** | **65.9** | 3240.4 | 3953.0 | **189** | **229** | 55 | 55 | **0** | 192.0 | 1512.0 |
-| `noisy_neighbor_tenant_a` | `tier_migration` | 0.0 | 120 | 54.74 | 5.3 | 62.3 | 124.3 | 0 | 120 | 0 | 0 | 144 | 128.0 | 0.0 |
-| `noisy_neighbor_tenant_a` | **`most_selective_mirror`** | 0.0 | 120 | **44.10** | 8.5 | **16.8** | **90.3** | 0 | **120** | 0 | 0 | **0** | 128.0 | 128.0 |
-| `negative_control_zero_reuse_scan` | `no_cache` | 0.0 | 240 | 6.68 | 22.9 | 29.2 | 64.7 | 240 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
-| `negative_control_zero_reuse_scan` | `tier_migration` | 0.0 | 240 | 59.05 | 226.4 | 445.4 | 678.3 | 240 | 0 | 0 | 0 | 216 | 192.0 | 1728.0 |
-| `negative_control_zero_reuse_scan` | `most_selective_mirror` | 0.0 | 240 | 55.82 | 195.4 | 417.7 | 1108.0 | 240 | 0 | 0 | 0 | **0** | **0.0** | 1920.0 |
+| `zipf_shared_toolchain_unthrottled` | `no_cache` | 0.0 | 2400 | 62.36 | 22.8 | 703.7 | 1122.5 | 2400 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
+| `zipf_shared_toolchain_unthrottled` | `tier_migration` | 0.0 | 2400 | 3616.19 | 6.2 | 2662.8 | 233319.1 | 418 | 1386 | 595 | 0 | 989 | 192.0 | 3136.0 |
+| `zipf_shared_toolchain_unthrottled` | **`most_selective_mirror`** | 0.0 | 2400 | **121.61** | **5.1** | **720.3** | **2939.1** | **416** | **1484** | 493 | 500 | **0** | 192.0 | 3328.0 |
+| `zipf_shared_toolchain_sim2ms` | `no_cache` | 2.0 | 480 | 292.05 | 2420.8 | 2578.5 | 3103.4 | 480 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
+| `zipf_shared_toolchain_sim2ms` | `tier_migration` | 2.0 | 480 | 493.06 | 385.1 | 3619.1 | 5757.0 | 190 | 200 | 85 | 0 | 251 | 192.0 | 1320.0 |
+| `zipf_shared_toolchain_sim2ms` | **`most_selective_mirror`** | 2.0 | 480 | **173.57** | **103.1** | **3519.3** | 5838.4 | **189** | **229** | 55 | 62 | **0** | 192.0 | 1512.0 |
+| `noisy_neighbor_tenant_a` | `tier_migration` | 0.0 | 120 | 85.44 | 3.0 | 62.5 | 237.0 | 0 | 120 | 0 | 0 | 144 | 128.0 | 0.0 |
+| `noisy_neighbor_tenant_a` | **`most_selective_mirror`** | 0.0 | 120 | 474.60 | 3.0 | **17.6** | **148.8** | 0 | **120** | 0 | 0 | **0** | 128.0 | 128.0 |
+| `negative_control_zero_reuse_scan` | `no_cache` | 0.0 | 240 | 8.42 | 24.6 | 67.7 | 179.2 | 240 | 0 | 0 | 0 | 0 | 0.0 | 0.0 |
+| `negative_control_zero_reuse_scan` | `tier_migration` | 0.0 | 240 | 109.72 | 363.7 | 836.0 | 3513.8 | 240 | 0 | 0 | 0 | 216 | 192.0 | 1728.0 |
+| `negative_control_zero_reuse_scan` | `most_selective_mirror` | 0.0 | 240 | 76.66 | 272.9 | 617.5 | 1225.5 | 240 | 0 | 0 | 0 | **0** | **0.0** | 1920.0 |
 
 * **Memory & GC (`runtime.MemStats` on `zipf_shared_toolchain_unthrottled`):**
-  `tier_migration` allocated `65,626,968 B` (`14` GCs) vs `42,335,728 B` (`9` GCs) for `most_selective_mirror` (`-35.5%` allocation churn due to zero demotion re-sealing).
+  `tier_migration` allocated `120,637,920 B` (`27` GCs) vs `65,221,888 B` (`13` GCs) for `most_selective_mirror` (`-45.9%` allocation churn due to zero demotion re-sealing of encrypted NVMe shared frames).
+* **Single-cache-tier comparison on the exact same trace (`#99` / `#124` convergence):**
+  Both `PolicySelectiveMirror` and `PolicyTierMigration` run inside the exact same single `most.Engine` cache tier (`vfs.Config.Cache = 0` or identical outer volume config) over the exact same pre-published `ArtifactManifest` and deterministic PCG Zipfian trace (`4` agents, `2400` ops, `HotThreshold = 2.0`, encrypted `HostCacheCipher` NVMe frames). Under encrypted NVMe disk frames, `PolicyTierMigration` suffers heavy re-encryption + rename write amplification on every RAM eviction (`989` demotion writes, `P99 = 233.32 ms`), whereas `PolicySelectiveMirror` writes to NVMe only once on cold backend admission (`0` demotion writes, `P99 = 2.94 ms`, `-98.7%` tail latency, `1484` vs `1386` RAM hits).
 * **Live `vfs.Volume` over `storetest.S3` (`most_test.go`):**
   * `TestMOSTSharedImmutableToolchainWithRealVolume`: 4 concurrent agents over
     2 cold-volume passes (`8` shared toolchain mounts + `4` private `vfs.Hybrid`
@@ -152,13 +173,18 @@ have `0.0 ms` injected delay. Raw data is in [`docs/most.csv`](./most.csv).
 
 ```go
 eng, _ := most.NewEngine(rootS3Backend, most.Config{
-    Policy:         most.PolicySelectiveMirror,
-    NVMeDir:        "/var/cache/visor/most-nvme",
-    TotalRAMBytes:  512 << 20,
-    TotalNVMeBytes: 8 << 30,
-    HotThreshold:   2.0,
-    SharedPrefix:   "toolchain",
+    Policy:               most.PolicySelectiveMirror,
+    NVMeDir:              "/var/cache/visor/most-nvme",
+    TotalRAMBytes:        512 << 20,
+    TotalNVMeBytes:       8 << 30,
+    HotThreshold:         2.0,
+    SharedPrefix:         "toolchain",
+    HostCacheCipher:      vfs.Hybrid(hostNVMeKey),
+    SharedManifestCipher: vfs.Hybrid(manifestKey),
 })
+// Load independently authenticated immutable artifact manifest on startup (zero TOFU):
+_, _ = eng.LoadArtifactManifest(ctx, "toolchain-v1", vfs.Hybrid(manifestKey))
+
 _ = eng.RegisterTenant(agentID, volID, vfs.Hybrid(agentKey), 128<<20, 1<<30)
 
 // Shared immutable toolchain mounted read-only across agents:

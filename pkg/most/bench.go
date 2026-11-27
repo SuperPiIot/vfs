@@ -276,38 +276,54 @@ func runZipfWorkload(
 	probe := NewProbeBackend(storetest.NewMem(), 0)
 
 	// Populate immutable objects before timing (0ms delay during setup).
+	files := make(map[string][]byte, numHot+numScan)
 	for i := range numHot {
-		if err := probe.Put(ctx, fmt.Sprintf("tc/%04d", i), deterministicBlock(uint64(100+i), blockSize)); err != nil {
-			return BenchmarkRow{}, err
+		k := fmt.Sprintf("tc/%04d", i)
+		b := deterministicBlock(uint64(100+i), blockSize)
+		files[k] = b
+		if !useEngine {
+			if err := probe.Put(ctx, k, b); err != nil {
+				return BenchmarkRow{}, err
+			}
 		}
 	}
 	for i := range numScan {
-		if err := probe.Put(ctx, fmt.Sprintf("scan/%04d", i), deterministicBlock(uint64(10000+i), blockSize)); err != nil {
-			return BenchmarkRow{}, err
+		k := fmt.Sprintf("scan/%04d", i)
+		b := deterministicBlock(uint64(10000+i), blockSize)
+		files[k] = b
+		if !useEngine {
+			if err := probe.Put(ctx, k, b); err != nil {
+				return BenchmarkRow{}, err
+			}
 		}
 	}
 
 	var eng *Engine
 	if useEngine {
+		ciph, err := newBenchCipher("zipf-bench")
+		if err != nil {
+			return BenchmarkRow{}, err
+		}
 		eng, err = NewEngine(probe, Config{
-			Policy:         policy,
-			NVMeDir:        nvmeDir,
-			TotalRAMBytes:  ramCap,
-			TotalNVMeBytes: nvmeCap,
-			HotThreshold:   2.0,
+			Policy:               policy,
+			NVMeDir:              nvmeDir,
+			TotalRAMBytes:        ramCap,
+			TotalNVMeBytes:       nvmeCap,
+			HotThreshold:         2.0,
+			HostCacheCipher:      ciph,
+			SharedManifestCipher: ciph,
 		})
 		if err != nil {
 			return BenchmarkRow{}, err
 		}
 		defer eng.Close()
-		ciph, err := newBenchCipher("zipf-bench")
-		if err != nil {
-			return BenchmarkRow{}, err
-		}
 		for a := range agents {
 			if err := eng.RegisterTenant(fmt.Sprintf("ag-%d", a), fmt.Sprintf("v-%d", a), ciph, ramCap, nvmeCap); err != nil {
 				return BenchmarkRow{}, err
 			}
+		}
+		if _, err := eng.PublishSharedArtifact(ctx, "zipf-toolchain", files, ciph); err != nil {
+			return BenchmarkRow{}, err
 		}
 	}
 
@@ -532,27 +548,38 @@ func runZeroReuseNegativeControl(
 	defer os.RemoveAll(sub)
 
 	probe := NewProbeBackend(storetest.NewMem(), 0)
+	files := make(map[string][]byte, scanCount)
 	for i := range scanCount {
-		if err := probe.Put(ctx, fmt.Sprintf("once/%04d", i), deterministicBlock(uint64(90000+i), blockSize)); err != nil {
-			return BenchmarkRow{}, err
+		k := fmt.Sprintf("once/%04d", i)
+		b := deterministicBlock(uint64(90000+i), blockSize)
+		files[k] = b
+		if !useEngine {
+			if err := probe.Put(ctx, k, b); err != nil {
+				return BenchmarkRow{}, err
+			}
 		}
 	}
 
 	var eng *Engine
 	if useEngine {
+		ciph, _ := newBenchCipher("neg-ctl")
 		eng, err = NewEngine(probe, Config{
-			Policy:         policy,
-			NVMeDir:        filepath.Join(sub, "nvme"),
-			TotalRAMBytes:  ramCap,
-			TotalNVMeBytes: nvmeCap,
-			HotThreshold:   2.0,
+			Policy:               policy,
+			NVMeDir:              filepath.Join(sub, "nvme"),
+			TotalRAMBytes:        ramCap,
+			TotalNVMeBytes:       nvmeCap,
+			HotThreshold:         2.0,
+			HostCacheCipher:      ciph,
+			SharedManifestCipher: ciph,
 		})
 		if err != nil {
 			return BenchmarkRow{}, err
 		}
 		defer eng.Close()
-		ciph, _ := newBenchCipher("neg-ctl")
 		_ = eng.RegisterTenant("neg", "vol-neg", ciph, ramCap, nvmeCap)
+		if _, err := eng.PublishSharedArtifact(ctx, "neg-scan", files, ciph); err != nil {
+			return BenchmarkRow{}, err
+		}
 	}
 
 	probe.Reset(0)

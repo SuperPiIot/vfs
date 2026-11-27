@@ -679,3 +679,408 @@ func TestTenantBackendContractAndConcurrency(t *testing.T) {
 		}
 	})
 }
+
+type badPlaintextCipher struct{}
+
+func (badPlaintextCipher) Seal(plain []byte) ([]byte, string, error) {
+	return append([]byte("RAW:"), plain...), "plain-k", nil
+}
+
+func (badPlaintextCipher) Open(sealed []byte, keyID string) ([]byte, error) {
+	return bytes.TrimPrefix(sealed, []byte("RAW:")), nil
+}
+
+func TestMOSTColdRestartAuthenticatedManifestAndFailClosedUnregistered(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	manifestCipher := newTestCipher(t, "publisher-manifest-key")
+	wrongCipher := newTestCipher(t, "wrong-manifest-key")
+	hostCipher := newTestCipher(t, "host-cache-key")
+
+	// Reject plaintext/identity ciphers fail-closed at Engine construction and tenant registration.
+	if _, err := most.NewEngine(mem, most.Config{HostCacheCipher: badPlaintextCipher{}}); !errors.Is(err, most.ErrInvalidConfig) && !errors.Is(err, most.ErrBadCipher) {
+		t.Fatalf("NewEngine with plaintext HostCacheCipher err = %v, want ErrInvalidConfig/ErrBadCipher", err)
+	}
+	if _, err := most.NewEngine(mem, most.Config{SharedManifestCipher: badPlaintextCipher{}}); !errors.Is(err, most.ErrInvalidConfig) && !errors.Is(err, most.ErrBadCipher) {
+		t.Fatalf("NewEngine with plaintext SharedManifestCipher err = %v, want ErrInvalidConfig/ErrBadCipher", err)
+	}
+
+	eng1, err := most.NewEngine(mem, most.Config{
+		Policy:               most.PolicySelectiveMirror,
+		NVMeDir:              t.TempDir(),
+		SharedPrefix:         "toolchain",
+		HostCacheCipher:      hostCipher,
+		SharedManifestCipher: manifestCipher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng1.Close()
+
+	if err := eng1.RegisterTenant("bad", "vbad", badPlaintextCipher{}, 1<<20, 1<<20); !errors.Is(err, most.ErrInvalidConfig) {
+		t.Fatalf("RegisterTenant with plaintext cipher err = %v, want ErrInvalidConfig", err)
+	}
+
+	files := map[string][]byte{
+		"go/bin/go":      []byte("ELF-go-1.26-compiler-binary-payload-v1"),
+		"go/bin/gofmt":   []byte("ELF-gofmt-1.26-formatter-binary-payload-v1"),
+		"go/pkg/runtime": []byte("ARCHIVE-go-runtime-stdlib-payload-v1"),
+	}
+	pubFiles := map[string][]byte{
+		"pub/libc.so": []byte("ELF-public-glibc-shared-object-v1"),
+	}
+	if _, err := eng1.PublishSharedArtifact(ctx, "go-1.26", files, manifestCipher); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng1.PublishPublicArtifact(ctx, "glibc-2.39", pubFiles, manifestCipher); err != nil {
+		t.Fatal(err)
+	}
+	// Also write an unmanifested rogue object directly into backend storage.
+	if err := mem.Put(ctx, "toolchain/rogue/backdoor", []byte("unregistered-tofu-attempt")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a cold host restart: brand-new Engine on empty NVMe and empty RAM over the same backend.
+	eng2, err := most.NewEngine(mem, most.Config{
+		Policy:          most.PolicySelectiveMirror,
+		NVMeDir:         t.TempDir(),
+		SharedPrefix:    "toolchain",
+		HostCacheCipher: newTestCipher(t, "host-cache-key-after-restart"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+
+	if err := eng2.RegisterTenant("agent-1", "vol-1", newTestCipher(t, "agent-1"), 4<<20, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+
+	// BEFORE LoadArtifactManifest, reading ANY shared/public object MUST fail closed with ErrUnregisteredArtifact (zero TOFU!).
+	for k := range files {
+		if _, err := eng2.Get(ctx, "agent-1", most.ScopeSharedImmutable, k, backend.Unbounded); !errors.Is(err, most.ErrUnregisteredArtifact) {
+			t.Fatalf("pre-manifest Get(%s) err = %v, want ErrUnregisteredArtifact", k, err)
+		}
+		if _, err := eng2.GetRange(ctx, "agent-1", most.ScopeSharedImmutable, k, 0, 4); !errors.Is(err, most.ErrUnregisteredArtifact) {
+			t.Fatalf("pre-manifest GetRange(%s) err = %v, want ErrUnregisteredArtifact", k, err)
+		}
+		if _, err := eng2.Stat(ctx, "agent-1", most.ScopeSharedImmutable, k); !errors.Is(err, most.ErrUnregisteredArtifact) {
+			t.Fatalf("pre-manifest Stat(%s) err = %v, want ErrUnregisteredArtifact", k, err)
+		}
+	}
+
+	// Loading manifest with wrong key MUST fail closed with ErrIntegrityViolation!
+	if _, err := eng2.LoadArtifactManifest(ctx, "go-1.26", wrongCipher); !errors.Is(err, most.ErrIntegrityViolation) {
+		t.Fatalf("LoadArtifactManifest with wrong key err = %v, want ErrIntegrityViolation", err)
+	}
+
+	// Load authenticated manifests with the publisher's manifestCipher.
+	if _, err := eng2.LoadArtifactManifest(ctx, "go-1.26", manifestCipher); err != nil {
+		t.Fatalf("LoadArtifactManifest(go-1.26): %v", err)
+	}
+	if _, err := eng2.LoadArtifactManifest(ctx, "glibc-2.39", manifestCipher); err != nil {
+		t.Fatalf("LoadArtifactManifest(glibc-2.39): %v", err)
+	}
+
+	// Registered entries now succeed and match byte-for-byte.
+	for k, want := range files {
+		got, err := eng2.Get(ctx, "agent-1", most.ScopeSharedImmutable, k, backend.Unbounded)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("post-manifest Get(%s) = %q (%v), want %q", k, got, err, want)
+		}
+		// ScopePublicImmutable cannot read non-public ScopeSharedImmutable keys!
+		if _, err := eng2.Get(ctx, "agent-1", most.ScopePublicImmutable, k, backend.Unbounded); !errors.Is(err, most.ErrTenantUnauthorized) {
+			t.Fatalf("ScopePublicImmutable reading ScopeSharedImmutable key %s err = %v, want ErrTenantUnauthorized", k, err)
+		}
+	}
+	gotPub, err := eng2.Get(ctx, "agent-1", most.ScopePublicImmutable, "pub/libc.so", backend.Unbounded)
+	if err != nil || !bytes.Equal(gotPub, pubFiles["pub/libc.so"]) {
+		t.Fatalf("ScopePublicImmutable Get(pub/libc.so) = %q (%v)", gotPub, err)
+	}
+
+	// Unmanifested rogue object in the same prefix still fails closed with ErrUnregisteredArtifact!
+	if _, err := eng2.Get(ctx, "agent-1", most.ScopeSharedImmutable, "rogue/backdoor", backend.Unbounded); !errors.Is(err, most.ErrUnregisteredArtifact) {
+		t.Fatalf("unmanifested rogue Get err = %v, want ErrUnregisteredArtifact", err)
+	}
+
+	// Tamper with the stored manifest bytes in backend and verify a cold Engine rejects it.
+	var mKey string
+	for _, k := range mem.Keys() {
+		if bytes.HasPrefix([]byte(k), []byte("toolchain/manifests/")) {
+			raw, _, _ := mem.Get(ctx, k, backend.Unbounded)
+			// Find the go-1.26 manifest by trying LoadArtifactManifest after flipping or checking both manifests.
+			_ = raw
+			mKey = k
+		}
+	}
+	for _, k := range mem.Keys() {
+		if bytes.HasPrefix([]byte(k), []byte("toolchain/manifests/")) {
+			rawMan, _, err := mem.Get(ctx, k, backend.Unbounded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rawMan[len(rawMan)-1] ^= 0x80
+			if err := mem.Put(ctx, k, rawMan); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_ = mKey
+	eng3, err := most.NewEngine(mem, most.Config{Policy: most.PolicySelectiveMirror, SharedPrefix: "toolchain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng3.Close()
+	if _, err := eng3.LoadArtifactManifest(ctx, "go-1.26", manifestCipher); !errors.Is(err, most.ErrIntegrityViolation) {
+		t.Fatalf("tampered manifest LoadArtifactManifest err = %v, want ErrIntegrityViolation", err)
+	}
+}
+
+func TestMOSTConcurrentConditionalPublishAndReplacementRejection(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	mc := newTestCipher(t, "manifest-cas-cipher")
+	eng, err := most.NewEngine(mem, most.Config{
+		Policy:               most.PolicySelectiveMirror,
+		SharedPrefix:         "shared",
+		SharedManifestCipher: mc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	files := map[string][]byte{
+		"llvm/bin/clang": []byte("clang-19-immutable-binary-content-0001"),
+		"llvm/bin/lld":   []byte("lld-19-immutable-linker-content-0002"),
+	}
+
+	// 8 concurrent goroutines publishing the exact same artifact via PutIfAbsent must all succeed idempotently.
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := eng.PublishSharedArtifact(ctx, "llvm-19", files, mc); err != nil {
+				t.Errorf("concurrent idempotent PublishSharedArtifact failed: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// Attempting to replace an existing shared object key with different content MUST fail closed with ErrImmutableConflict.
+	conflictingKeyFiles := map[string][]byte{
+		"llvm/bin/clang": []byte("TAMPERED-clang-19-replacement-payload"),
+	}
+	if _, err := eng.PublishSharedArtifact(ctx, "llvm-19-evil", conflictingKeyFiles, mc); !errors.Is(err, most.ErrImmutableConflict) {
+		t.Fatalf("conflicting object replacement err = %v, want ErrImmutableConflict", err)
+	}
+	if _, err := eng.PublishShared(ctx, "llvm/bin/clang", []byte("TAMPERED-single-publish")); !errors.Is(err, most.ErrImmutableConflict) {
+		t.Fatalf("conflicting PublishShared err = %v, want ErrImmutableConflict", err)
+	}
+
+	// Attempting to replace an existing manifest ID ("llvm-19") with a different file map MUST fail closed with ErrImmutableConflict.
+	differentManifestFiles := map[string][]byte{
+		"llvm/bin/clang":   files["llvm/bin/clang"],
+		"llvm/bin/lld":     files["llvm/bin/lld"],
+		"llvm/bin/llvm-ar": []byte("extra-tool-in-same-manifest-id"),
+	}
+	if _, err := eng.PublishSharedArtifact(ctx, "llvm-19", differentManifestFiles, mc); !errors.Is(err, most.ErrImmutableConflict) {
+		t.Fatalf("conflicting manifest ID replacement err = %v, want ErrImmutableConflict", err)
+	}
+
+	// Verify original payload remains untampered.
+	if err := eng.RegisterTenant("reader", "v-reader", newTestCipher(t, "r"), 1<<20, 4<<20); err != nil {
+		t.Fatal(err)
+	}
+	got, err := eng.Get(ctx, "reader", most.ScopeSharedImmutable, "llvm/bin/clang", backend.Unbounded)
+	if err != nil || !bytes.Equal(got, files["llvm/bin/clang"]) {
+		t.Fatalf("Get after rejected replacement = %q (%v)", got, err)
+	}
+}
+
+func TestMOSTDigestPoisoningAndCiphertextOnlyNVMeDisk(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	nvmeDir := t.TempDir()
+	hostCipher := newTestCipher(t, "nvme-host-disk-cipher")
+	manCipher := newTestCipher(t, "manifest-auth-cipher")
+	privCipher := newTestCipher(t, "tenant-private-cipher")
+
+	eng, err := most.NewEngine(mem, most.Config{
+		Policy:               most.PolicySelectiveMirror,
+		NVMeDir:              nvmeDir,
+		SharedPrefix:         "tc",
+		HostCacheCipher:      hostCipher,
+		SharedManifestCipher: manCipher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if err := eng.RegisterTenant("t1", "vol-1", privCipher, 4<<20, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+
+	sharedPlain := []byte("UNIQUE-SHARED-TOOLCHAIN-MARKER-RUSTC-1.85-BINARY-PAYLOAD")
+	publicPlain := []byte("UNIQUE-PUBLIC-TOOLCHAIN-MARKER-MUSL-LIBC-BINARY-PAYLOAD")
+	privatePlain := []byte("UNIQUE-PRIVATE-TENANT-SECRET-API-KEY-9876543210-PAYLOAD")
+	poisonedTarget := []byte("UNIQUE-POISON-TARGET-SHARED-ARTIFACT-PAYLOAD-ORIGINAL")
+
+	if _, err := eng.PublishSharedArtifact(ctx, "rust-1.85", map[string][]byte{
+		"bin/rustc":  sharedPlain,
+		"bin/poison": poisonedTarget,
+	}, manCipher); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.PublishPublicArtifact(ctx, "musl-1.2", map[string][]byte{
+		"lib/libc.a": publicPlain,
+	}, manCipher); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Put(ctx, "t1", most.ScopePrivate, "secrets/token", privatePlain); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read shared, public, and private keys so all three are populated into the NVMe disk tier.
+	if got, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "bin/rustc", backend.Unbounded); err != nil || !bytes.Equal(got, sharedPlain) {
+		t.Fatalf("shared Get failed: %v", err)
+	}
+	if got, err := eng.Get(ctx, "t1", most.ScopePublicImmutable, "lib/libc.a", backend.Unbounded); err != nil || !bytes.Equal(got, publicPlain) {
+		t.Fatalf("public Get failed: %v", err)
+	}
+	if got, err := eng.Get(ctx, "t1", most.ScopePrivate, "secrets/token", backend.Unbounded); err != nil || !bytes.Equal(got, privatePlain) {
+		t.Fatalf("private Get failed: %v", err)
+	}
+
+	// Scan EVERY file on NVMe disk: zero raw plaintext for private, shared, OR public artifacts!
+	nvmeFiles := 0
+	err = filepath.WalkDir(nvmeDir, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil || d.IsDir() {
+			return werr
+		}
+		nvmeFiles++
+		raw, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		for _, marker := range [][]byte{
+			sharedPlain,
+			publicPlain,
+			privatePlain,
+			[]byte("UNIQUE-SHARED-TOOLCHAIN-MARKER"),
+			[]byte("UNIQUE-PUBLIC-TOOLCHAIN-MARKER"),
+			[]byte("UNIQUE-PRIVATE-TENANT-SECRET"),
+		} {
+			if bytes.Contains(raw, marker) {
+				t.Fatalf("NVMe disk file %s leaked raw plaintext marker %q!", path, marker)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nvmeFiles < 3 {
+		t.Fatalf("expected >= 3 encrypted NVMe files on disk, found %d", nvmeFiles)
+	}
+
+	// Poison/corrupt "tc/bin/poison" in the backend BEFORE it is ever cached:
+	// reading it must fail closed with ErrIntegrityViolation and never populate RAM or NVMe!
+	if err := mem.Put(ctx, "tc/bin/poison", []byte("CORRUPTED-BY-STORAGE-MITM-SAME-OR-DIFF-LEN")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "bin/poison", backend.Unbounded); !errors.Is(err, most.ErrIntegrityViolation) {
+		t.Fatalf("poisoned backend Get err = %v, want ErrIntegrityViolation", err)
+	}
+	if _, err := eng.GetRange(ctx, "t1", most.ScopeSharedImmutable, "bin/poison", 0, 8); !errors.Is(err, most.ErrIntegrityViolation) {
+		t.Fatalf("poisoned backend GetRange err = %v, want ErrIntegrityViolation", err)
+	}
+}
+
+func TestMOSTACLRevocationBlocksSharedAndPrivateImmediately(t *testing.T) {
+	ctx := context.Background()
+	mem := storetest.NewMem()
+	eng, err := most.NewEngine(mem, most.Config{
+		Policy:        most.PolicySelectiveMirror,
+		HotThreshold:  2.0,
+		TotalRAMBytes: 16 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	c1 := newTestCipher(t, "t1-ciph")
+	c2 := newTestCipher(t, "t2-ciph")
+	if err := eng.RegisterTenant("t1", "v1", c1, 8<<20, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.RegisterTenant("t2", "v2", c2, 8<<20, 16<<20); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.PublishShared(ctx, "sdk/hot-tool", []byte("shared-hot-tool-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.PublishShared(ctx, "sdk/warm-tool", []byte("shared-warm-tool-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Put(ctx, "t1", most.ScopePrivate, "priv/key", []byte("t1-private-hot-payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm "sdk/hot-tool" into RAM (2 hits each by t1 and t2) and "sdk/warm-tool" into NVMe (1 hit).
+	for range 2 {
+		if _, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "sdk/hot-tool", backend.Unbounded); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Get(ctx, "t2", most.ScopeSharedImmutable, "sdk/hot-tool", backend.Unbounded); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := eng.Get(ctx, "t1", most.ScopePrivate, "priv/key", backend.Unbounded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "sdk/warm-tool", backend.Unbounded); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revoke shared access for t1 via SetSharedAccess(t1, false):
+	// BOTH RAM-hot ("sdk/hot-tool") and NVMe-warm ("sdk/warm-tool") reads must immediately fail with ErrTenantUnauthorized!
+	if err := eng.SetSharedAccess("t1", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "sdk/hot-tool", backend.Unbounded); !errors.Is(err, most.ErrTenantUnauthorized) {
+		t.Fatalf("after SetSharedAccess(false), RAM-hot shared Get err = %v, want ErrTenantUnauthorized", err)
+	}
+	if _, err := eng.Get(ctx, "t1", most.ScopeSharedImmutable, "sdk/warm-tool", backend.Unbounded); !errors.Is(err, most.ErrTenantUnauthorized) {
+		t.Fatalf("after SetSharedAccess(false), NVMe-warm shared Get err = %v, want ErrTenantUnauthorized", err)
+	}
+	if _, err := eng.GetRange(ctx, "t1", most.ScopeSharedImmutable, "sdk/hot-tool", 0, 6); !errors.Is(err, most.ErrTenantUnauthorized) {
+		t.Fatalf("after SetSharedAccess(false), shared GetRange err = %v, want ErrTenantUnauthorized", err)
+	}
+	if _, err := eng.Stat(ctx, "t1", most.ScopeSharedImmutable, "sdk/hot-tool"); !errors.Is(err, most.ErrTenantUnauthorized) {
+		t.Fatalf("after SetSharedAccess(false), shared Stat err = %v, want ErrTenantUnauthorized", err)
+	}
+
+	// Authorized tenant t2 still hits RAM on "sdk/hot-tool", and t1 can still read its own private key.
+	if got, err := eng.Get(ctx, "t2", most.ScopeSharedImmutable, "sdk/hot-tool", backend.Unbounded); err != nil || string(got) != "shared-hot-tool-payload" {
+		t.Fatalf("t2 shared Get after t1 ACL revocation failed: %v", err)
+	}
+	if got, err := eng.Get(ctx, "t1", most.ScopePrivate, "priv/key", backend.Unbounded); err != nil || string(got) != "t1-private-hot-payload" {
+		t.Fatalf("t1 private Get after shared ACL revocation failed: %v", err)
+	}
+
+	// Full RevokeTenant("t1") immediately denies private RAM-hot hits as well.
+	if err := eng.RevokeTenant("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Get(ctx, "t1", most.ScopePrivate, "priv/key", backend.Unbounded); !errors.Is(err, most.ErrTenantUnauthorized) {
+		t.Fatalf("after RevokeTenant(t1), private Get err = %v, want ErrTenantUnauthorized", err)
+	}
+}

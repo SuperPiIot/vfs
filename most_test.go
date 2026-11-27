@@ -106,18 +106,27 @@ func TestMOSTSharedImmutableToolchainWithRealVolume(t *testing.T) {
 	// Now mount 4 concurrent agents via most.Engine over root S3 bucket.
 	rootS3 := openS3At(t, srv, "")
 	nvmeDir := t.TempDir()
+	hostCipher := vfs.Hybrid(newKey(t))
+	manifestCipher := vfs.Hybrid(newKey(t))
 	eng, err := most.NewEngine(rootS3, most.Config{
-		Policy:         most.PolicySelectiveMirror,
-		NVMeDir:        nvmeDir,
-		TotalRAMBytes:  32 << 20,
-		TotalNVMeBytes: 128 << 20,
-		HotThreshold:   2.0,
-		SharedPrefix:   "toolchain",
+		Policy:               most.PolicySelectiveMirror,
+		NVMeDir:              nvmeDir,
+		TotalRAMBytes:        32 << 20,
+		TotalNVMeBytes:       128 << 20,
+		HotThreshold:         2.0,
+		SharedPrefix:         "toolchain",
+		HostCacheCipher:      hostCipher,
+		SharedManifestCipher: manifestCipher,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer eng.Close()
+
+	// Seal and conditionally publish the authenticated ArtifactManifest for the finalized toolchain Volume.
+	if _, err := eng.SnapshotPrefixManifest(ctx, "base-toolchain-v1", most.ScopeSharedImmutable, manifestCipher); err != nil {
+		t.Fatal(err)
+	}
 
 	const agents = 4
 	agentCiphers := make([]vfs.Cipher, agents)
@@ -187,12 +196,34 @@ func TestMOSTSharedImmutableToolchainWithRealVolume(t *testing.T) {
 		return nil
 	})
 
-	// Shared toolchain warm/concurrent read test across 4 agents (2 cold-volume passes each = 8 mounts).
+	// Shared toolchain warm/concurrent read test across 4 agents (2 passes each = 8 mounts):
+	// First agent mount warms the encrypted NVMe shared tier from S3; subsequent concurrent
+	// agent mounts hit NVMe -> promote to RAM mirror -> serve from RAM with 0 demotion writes.
 	eng.ResetStats()
 	reqsBeforeMOST := srv.Requests()
+	roWarm, err := vfs.Open(ctx, vfs.Config{
+		Backend: most.NewSharedBackend(eng, "agent-0"),
+		Cipher:  tcCipher,
+		Cache:   128 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range toolchainFiles {
+		in, err := roWarm.Resolve(ctx, f.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEqual(t, "warm "+f.path, readAll(t, roWarm, in.ID), f.data)
+	}
+	_ = roWarm.Close()
+
 	for pass := range 2 {
 		var wg sync.WaitGroup
 		for i := range agents {
+			if pass == 0 && i == 0 {
+				continue
+			}
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
@@ -425,15 +456,15 @@ func TestMOSTSelectiveMirrorVsTierMigrationZipf(t *testing.T) {
 			}
 		}
 
+		sharedFiles := make(map[string][]byte, numSharedHot+numColdScan)
 		for i := range numSharedHot {
-			if _, err := eng.PublishShared(ctx, fmt.Sprintf("tc-%03d", i), content(uint64(100+i), blockSize)); err != nil {
-				t.Fatal(err)
-			}
+			sharedFiles[fmt.Sprintf("tc-%03d", i)] = content(uint64(100+i), blockSize)
 		}
 		for i := range numColdScan {
-			if _, err := eng.PublishShared(ctx, fmt.Sprintf("scan-%04d", i), content(uint64(10000+i), blockSize)); err != nil {
-				t.Fatal(err)
-			}
+			sharedFiles[fmt.Sprintf("scan-%04d", i)] = content(uint64(10000+i), blockSize)
+		}
+		if _, err := eng.PublishSharedArtifact(ctx, "zipf-toolchain", sharedFiles, ciph); err != nil {
+			t.Fatal(err)
 		}
 
 		// Precompute deterministic Zipfian weights.
@@ -458,11 +489,23 @@ func TestMOSTSelectiveMirrorVsTierMigrationZipf(t *testing.T) {
 			return lo
 		}
 
+		// Warm the shared toolchain tier into NVMe with 1 initial scan pass, then run
+		// the concurrent 4-agent Zipfian + 1-hit cold scan trace so both policies start
+		// from an identical warm NVMe state without singleflight startup scheduler jitter.
+		for i := range numSharedHot {
+			if _, err := eng.Get(ctx, "ag-0", most.ScopeSharedImmutable, fmt.Sprintf("tc-%03d", i), backend.Unbounded); err != nil {
+				t.Fatal(err)
+			}
+		}
+		eng.ResetStats()
+
 		var wg sync.WaitGroup
+		start := make(chan struct{})
 		for a := range numAgents {
 			wg.Add(1)
 			go func(agentIdx int) {
 				defer wg.Done()
+				<-start
 				rng := rand.New(rand.NewPCG(uint64(42+agentIdx), uint64(99+agentIdx)))
 				tid := fmt.Sprintf("ag-%d", agentIdx)
 				scanBase := agentIdx * (numColdScan / numAgents)
@@ -482,6 +525,7 @@ func TestMOSTSelectiveMirrorVsTierMigrationZipf(t *testing.T) {
 				}
 			}(a)
 		}
+		close(start)
 		wg.Wait()
 
 		st := eng.Stats()
@@ -518,4 +562,185 @@ func TestMOSTSelectiveMirrorVsTierMigrationZipf(t *testing.T) {
 func newTestCipherForZipf(t testing.TB) vfs.Cipher {
 	t.Helper()
 	return vfs.Hybrid(newKey(t))
+}
+
+func TestMOSTColdRestartAuthenticatedManifestAndFailClosedUnregistered(t *testing.T) {
+	srv := storetest.NewS3(t, "most-cold-restart")
+	rootS3 := openS3At(t, srv, "")
+	manifestCipher := vfs.Hybrid(newKey(t))
+	wrongManifestCipher := vfs.Hybrid(newKey(t))
+	hostCipher1 := vfs.Hybrid(newKey(t))
+
+	eng1, err := most.NewEngine(rootS3, most.Config{
+		Policy:               most.PolicySelectiveMirror,
+		NVMeDir:              t.TempDir(),
+		SharedPrefix:         "tc",
+		HostCacheCipher:      hostCipher1,
+		SharedManifestCipher: manifestCipher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng1.Close()
+
+	artifactFiles := map[string][]byte{
+		"clang/bin/clang-19": content(101, 12<<10),
+		"clang/lib/libclang": content(202, 16<<10),
+	}
+	if _, err := eng1.PublishSharedArtifact(ctx, "clang-19.1", artifactFiles, manifestCipher); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate cold host restart with a brand-new Engine on empty RAM/NVMe over the same S3 backend.
+	eng2, err := most.NewEngine(rootS3, most.Config{
+		Policy:          most.PolicySelectiveMirror,
+		NVMeDir:         t.TempDir(),
+		SharedPrefix:    "tc",
+		HostCacheCipher: vfs.Hybrid(newKey(t)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+
+	if err := eng2.RegisterTenant("agent-cold", "vol-cold", vfs.Hybrid(newKey(t)), 8<<20, 32<<20); err != nil {
+		t.Fatal(err)
+	}
+	sharedBE := most.NewSharedBackend(eng2, "agent-cold")
+
+	// Before loading the authenticated manifest, every read MUST fail closed with ErrUnregisteredArtifact (no TOFU!).
+	for k := range artifactFiles {
+		if _, _, err := sharedBE.Get(ctx, k, backend.Unbounded); !errors.Is(err, most.ErrUnregisteredArtifact) {
+			t.Fatalf("cold restart Get(%s) before LoadArtifactManifest err = %v, want ErrUnregisteredArtifact", k, err)
+		}
+	}
+
+	// Wrong manifest key MUST fail closed with ErrIntegrityViolation!
+	if _, err := eng2.LoadArtifactManifest(ctx, "clang-19.1", wrongManifestCipher); !errors.Is(err, most.ErrIntegrityViolation) {
+		t.Fatalf("LoadArtifactManifest with wrong Hybrid key err = %v, want ErrIntegrityViolation", err)
+	}
+
+	// Load and verify with the genuine publisher vfs.Hybrid cipher.
+	if _, err := eng2.LoadArtifactManifest(ctx, "clang-19.1", manifestCipher); err != nil {
+		t.Fatalf("LoadArtifactManifest: %v", err)
+	}
+	for k, want := range artifactFiles {
+		got, _, err := sharedBE.Get(ctx, k, backend.Unbounded)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("post-manifest Get(%s) err=%v len=%d want=%d", k, err, len(got), len(want))
+		}
+	}
+}
+
+func TestMOSTTenantBackendCAS412Race(t *testing.T) {
+	srv := storetest.NewS3(t, "most-cas-412")
+	rootS3 := openS3At(t, srv, "")
+	eng, err := most.NewEngine(rootS3, most.Config{
+		Policy:          most.PolicySelectiveMirror,
+		NVMeDir:         t.TempDir(),
+		TotalRAMBytes:   16 << 20,
+		TotalNVMeBytes:  64 << 20,
+		HotThreshold:    2.0,
+		HostCacheCipher: vfs.Hybrid(newKey(t)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	tCipher := vfs.Hybrid(newKey(t))
+	if err := eng.RegisterTenant("cas-tenant", "vol-cas", tCipher, 8<<20, 32<<20); err != nil {
+		t.Fatal(err)
+	}
+	tb := most.NewTenantBackend(eng, "cas-tenant")
+
+	for _, targetKey := range []string{"head", "pack/00/cas-block"} {
+		// 1. Concurrent PutIfAbsent race: exactly 1 writer wins, 7 get HTTP 412 -> backend.ErrConflict.
+		const writers = 8
+		var absentWins int
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		startAbsent := make(chan struct{})
+		var winningPayload []byte
+		var winningVer backend.Version
+
+		for w := range writers {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				<-startAbsent
+				payload := fmt.Appendf(nil, "%s-init-writer-%d", targetKey, id)
+				ver, err := tb.PutIfAbsent(ctx, targetKey, payload)
+				if err == nil {
+					mu.Lock()
+					absentWins++
+					winningPayload = payload
+					winningVer = ver
+					mu.Unlock()
+				} else if !errors.Is(err, backend.ErrConflict) {
+					t.Errorf("PutIfAbsent(%s) writer %d err = %v, want ErrConflict", targetKey, id, err)
+				}
+			}(w)
+		}
+		close(startAbsent)
+		wg.Wait()
+
+		if absentWins != 1 || winningVer == "" {
+			t.Fatalf("%s PutIfAbsent wins = %d (ver=%q), want 1", targetKey, absentWins, winningVer)
+		}
+
+		// Warm the cache with multiple reads and verify exact winner payload.
+		for range 3 {
+			got, ver, err := tb.Get(ctx, targetKey, backend.Unbounded)
+			if err != nil || !bytes.Equal(got, winningPayload) || ver != winningVer {
+				t.Fatalf("%s Get after PutIfAbsent = %q ver=%q err=%v, want %q ver=%q",
+					targetKey, got, ver, err, winningPayload, winningVer)
+			}
+		}
+
+		// 2. Multi-round concurrent PutIfVersion race: in every round, warm RAM+NVMe cache,
+		// then race 8 writers on current version -> 1 wins, 7 get 412 ErrConflict, and subsequent
+		// cached reads immediately observe the new winner (zero stale cache hits).
+		curVer := winningVer
+		for round := range 6 {
+			var verWins int
+			var nextVer backend.Version
+			var nextPayload []byte
+			startVer := make(chan struct{})
+			for w := range writers {
+				wg.Add(1)
+				go func(id int) {
+					defer wg.Done()
+					<-startVer
+					payload := fmt.Appendf(nil, "%s-round-%d-writer-%d", targetKey, round, id)
+					v, err := tb.PutIfVersion(ctx, targetKey, payload, curVer)
+					if err == nil {
+						mu.Lock()
+						verWins++
+						nextVer = v
+						nextPayload = payload
+						mu.Unlock()
+					} else if !errors.Is(err, backend.ErrConflict) {
+						t.Errorf("PutIfVersion(%s) round %d writer %d err = %v, want ErrConflict", targetKey, round, id, err)
+					}
+				}(w)
+			}
+			close(startVer)
+			wg.Wait()
+
+			if verWins != 1 || nextVer == "" || nextVer == curVer {
+				t.Fatalf("%s round %d PutIfVersion wins=%d curVer=%q nextVer=%q", targetKey, round, verWins, curVer, nextVer)
+			}
+
+			// Warm cache again and verify zero stale data across 3 consecutive reads.
+			for hit := range 3 {
+				got, gotVer, err := tb.Get(ctx, targetKey, backend.Unbounded)
+				if err != nil || !bytes.Equal(got, nextPayload) {
+					t.Fatalf("%s round %d hit %d stale read: got %q (ver=%q err=%v), want %q (ver=%q)",
+						targetKey, round, hit, got, gotVer, err, nextPayload, nextVer)
+				}
+			}
+			curVer = nextVer
+		}
+	}
 }
