@@ -1,0 +1,12 @@
+workload,system,injected_delay_ms,agents,ops,block_bytes,total_wall_ms,throughput_ops_sec,p50_us,p95_us,p99_us,backend_gets,ram_hits,nvme_hits,mirror_promotions,tier_migration_writes,nvme_writes,resident_ram_bytes,resident_nvme_bytes,heap_alloc_delta_bytes,total_alloc_delta_bytes,num_gc_delta
+zipf_shared_toolchain_unthrottled,no_cache,0.00,4,2400,8192,66.224,36240.5,22.93,698.17,1154.50,2400,0,0,0,0,0,0,0,1114472,19827008,5
+zipf_shared_toolchain_unthrottled,tier_migration,0.00,4,2400,8192,1236.013,1941.7,7.03,909.91,13977.99,421,1382,593,0,990,990,196608,3211264,5205200,65626968,14
+zipf_shared_toolchain_unthrottled,most_selective_mirror,0.00,4,2400,8192,87.565,27407.9,5.46,456.81,2030.05,416,1492,489,489,0,416,196608,3407872,5817464,42335728,9
+zipf_shared_toolchain_sim2ms,no_cache,2.00,4,480,8192,293.705,1634.3,2371.75,2956.52,4000.03,480,0,0,0,0,0,0,0,1315448,3963424,1
+zipf_shared_toolchain_sim2ms,tier_migration,2.00,4,480,8192,169.640,2829.5,271.49,3417.33,4050.99,190,201,85,0,251,251,196608,1351680,1902896,16607080,5
+zipf_shared_toolchain_sim2ms,most_selective_mirror,2.00,4,480,8192,149.508,3210.5,65.86,3240.43,3953.00,189,229,55,55,0,189,196608,1548288,4307768,11055624,3
+noisy_neighbor_tenant_a,tier_migration,0.00,2,120,8192,54.741,5114.9,5.34,62.33,124.32,0,120,0,0,144,144,131072,0,2327280,22470336,10
+noisy_neighbor_tenant_a,most_selective_mirror,0.00,2,120,8192,44.105,6348.4,8.55,16.80,90.30,0,120,0,0,0,160,131072,131072,376840,15709144,6
+negative_control_zero_reuse_scan,no_cache,0.00,1,240,8192,6.677,35942.2,22.91,29.15,64.67,240,0,0,0,0,0,0,0,1699672,1982256,1
+negative_control_zero_reuse_scan,tier_migration,0.00,1,240,8192,59.049,4064.4,226.38,445.39,678.32,240,0,0,0,216,216,196608,1769472,3117792,13616280,4
+negative_control_zero_reuse_scan,most_selective_mirror,0.00,1,240,8192,55.819,4299.6,195.43,417.73,1108.04,240,0,0,0,0,240,0,1966080,728256,9743088,4
