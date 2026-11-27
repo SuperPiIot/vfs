@@ -607,8 +607,8 @@ func TestRASKMultiRegimeCompressionAndTradeoffs(t *testing.T) {
 	if !seqRes.ExactMatch {
 		t.Fatal("Regime A seq mismatch")
 	}
-	if seqRes.RaskBPerRun >= 10.0 {
-		t.Fatalf("expected Regime A RaskBPerRun < 10.0 B/run, got %.2f B/run", seqRes.RaskBPerRun)
+	if seqRes.RaskStructuralBytesPerRun >= 10.0 {
+		t.Fatalf("expected Regime A RaskStructuralBytesPerRun < 10.0 B/run, got %.2f B/run", seqRes.RaskStructuralBytesPerRun)
 	}
 	if seqRes.WideLeaves != 0 {
 		t.Fatalf("expected 0 wide leaves in clustered regime, got %d", seqRes.WideLeaves)
@@ -622,8 +622,8 @@ func TestRASKMultiRegimeCompressionAndTradeoffs(t *testing.T) {
 	if !randRes.ExactMatch {
 		t.Fatal("Regime A rand mismatch")
 	}
-	if randRes.RaskBPerRun >= 10.0 {
-		t.Fatalf("expected Regime A random+punch RaskBPerRun < 10.0 B/run, got %.2f B/run", randRes.RaskBPerRun)
+	if randRes.RaskStructuralBytesPerRun >= 10.0 {
+		t.Fatalf("expected Regime A random+punch RaskStructuralBytesPerRun < 10.0 B/run, got %.2f B/run", randRes.RaskStructuralBytesPerRun)
 	}
 
 	// Regime B: Widely scattered (> 4 GiB stride) 1 PiB workload -> exact representation via wide promotion.
@@ -639,16 +639,367 @@ func TestRASKMultiRegimeCompressionAndTradeoffs(t *testing.T) {
 		t.Fatalf("expected wide leaves in >4 GiB stride regime")
 	}
 	// Verify no 1-run leaf explosion (each wide leaf averages many runs, < 25 B/run).
-	if wideRes.RaskBPerRun > 25.0 {
-		t.Fatalf("unexpected leaf explosion in >4 GiB stride regime: %.2f B/run", wideRes.RaskBPerRun)
+	if wideRes.RaskStructuralBytesPerRun > 25.0 {
+		t.Fatalf("unexpected leaf explosion in >4 GiB stride regime: %.2f B/run", wideRes.RaskStructuralBytesPerRun)
 	}
 
-	t.Logf("Regime A (clustered seq):  rask=%.2f B/run vs baseline=%.2f B/run (savings=%.1f%%)",
-		seqRes.RaskBPerRun, seqRes.BaselineBPerRun, seqRes.MemSavingsPct)
-	t.Logf("Regime A (clustered rand): rask=%.2f B/run vs baseline=%.2f B/run (savings=%.1f%%, build %.2fms vs %.2fms)",
-		randRes.RaskBPerRun, randRes.BaselineBPerRun, randRes.MemSavingsPct, randRes.RaskBuildMs, randRes.BaselineBuildMs)
-	t.Logf("Regime B (5 GiB stride):   rask=%.2f B/run vs baseline=%.2f B/run (wideLeaves=%d)",
-		wideRes.RaskBPerRun, wideRes.BaselineBPerRun, wideRes.WideLeaves)
+	t.Logf("Regime A (clustered seq):  rask=%.2f B/run (heap=%d B) vs baseline=%.2f B/run (heap=%d B) (savings=%.1f%%)",
+		seqRes.RaskStructuralBytesPerRun, seqRes.RaskRetainedHeapAllocBytes, seqRes.BaselineStructuralBytesPerRun, seqRes.BaselineRetainedHeapAllocBytes, seqRes.StructuralSavingsPct)
+	t.Logf("Regime A (clustered rand): rask=%.2f B/run (heap=%d B) vs baseline=%.2f B/run (heap=%d B) (savings=%.1f%%, build %.2fms vs %.2fms)",
+		randRes.RaskStructuralBytesPerRun, randRes.RaskRetainedHeapAllocBytes, randRes.BaselineStructuralBytesPerRun, randRes.BaselineRetainedHeapAllocBytes, randRes.StructuralSavingsPct, randRes.RaskBuildMs, randRes.BaselineBuildMs)
+	t.Logf("Regime B (5 GiB stride):   rask=%.2f B/run (heap=%d B) vs baseline=%.2f B/run (heap=%d B) (wideLeaves=%d)",
+		wideRes.RaskStructuralBytesPerRun, wideRes.RaskRetainedHeapAllocBytes, wideRes.BaselineStructuralBytesPerRun, wideRes.BaselineRetainedHeapAllocBytes, wideRes.WideLeaves)
+}
+
+func TestRASKMaxOffsetAndOverflowGuards(t *testing.T) {
+	rask := NewRaskRunIndex()
+	oracle := NewBaselineRunSlice()
+
+	// 1. Degenerate wraparound / empty intervals must be ignored cleanly.
+	rask.InsertRange(100, 100)
+	rask.InsertRange(200, 100)
+	rask.InsertRange(math.MaxUint64, 0)
+	rask.InsertRange(math.MaxUint64, math.MaxUint64)
+	if rask.Len() != 0 {
+		t.Fatalf("expected empty index after degenerate intervals, got %d", rask.Len())
+	}
+
+	// 2. Exact 4 GiB boundary (1<<32 - 1 and 1<<32) adjacency & coalescing.
+	const fourGiB = uint64(1) << 32
+	rask.InsertRange(0, 16)
+	oracle.InsertRange(0, 16)
+	rask.InsertRange(fourGiB-16, fourGiB-1)
+	oracle.InsertRange(fourGiB-16, fourGiB-1)
+	assertRaskMatchesOracle(t, "4gib-minus-1", rask, oracle)
+
+	// Touching run [1<<32 - 1, 1<<32) coalesces to [1<<32 - 16, 1<<32) which spans
+	// exactly 1<<32 bytes from base 0 (end - base == 1<<32 > MaxUint32), triggering
+	// gap-split into two compact leaves!
+	rask.InsertRange(fourGiB-1, fourGiB)
+	oracle.InsertRange(fourGiB-1, fourGiB)
+	assertRaskMatchesOracle(t, "4gib-exact-touch", rask, oracle)
+
+	// Crossing 4 GiB boundary with an adjacent run [1<<32, 1<<32 + 64).
+	rask.InsertRange(fourGiB, fourGiB+64)
+	oracle.InsertRange(fourGiB, fourGiB+64)
+	assertRaskMatchesOracle(t, "4gib-cross-coalesce", rask, oracle)
+
+	// 3. MaxSize (1<<62) and math.MaxUint64 - 1024 .. math.MaxUint64 boundary operations.
+	rask.InsertRange(MaxSize-2048, MaxSize-1024)
+	oracle.InsertRange(MaxSize-2048, MaxSize-1024)
+	rask.InsertRange(MaxSize-1024, MaxSize)
+	oracle.InsertRange(MaxSize-1024, MaxSize)
+	rask.InsertRange(math.MaxUint64-1024, math.MaxUint64-512)
+	oracle.InsertRange(math.MaxUint64-1024, math.MaxUint64-512)
+	rask.InsertRange(math.MaxUint64-512, math.MaxUint64)
+	oracle.InsertRange(math.MaxUint64-512, math.MaxUint64)
+	assertRaskMatchesOracle(t, "max-offset-inserts", rask, oracle)
+
+	// Verify Contains / Overlaps / RangeOverlaps at MaxSize and MaxUint64 edges.
+	probeOffsets := []uint64{
+		0, 15, 16,
+		fourGiB - 17, fourGiB - 16, fourGiB - 1, fourGiB, fourGiB + 63, fourGiB + 64,
+		MaxSize - 2049, MaxSize - 2048, MaxSize - 1, MaxSize,
+		math.MaxUint64 - 1025, math.MaxUint64 - 1024, math.MaxUint64 - 1, math.MaxUint64,
+	}
+	for _, off := range probeOffsets {
+		if rask.Contains(off) != oracle.Contains(off) {
+			t.Fatalf("Contains(%d) mismatch at boundary", off)
+		}
+		hi := off + 32
+		if hi < off {
+			hi = math.MaxUint64
+		}
+		if rask.Overlaps(off, hi) != oracle.Overlaps(off, hi) {
+			t.Fatalf("Overlaps([%d,%d)) mismatch at boundary", off, hi)
+		}
+	}
+
+	var gotRange []run
+	rask.RangeOverlaps(fourGiB-8, math.MaxUint64, func(r run) {
+		gotRange = append(gotRange, r)
+	})
+	if len(gotRange) != 3 {
+		t.Fatalf("expected 3 overlapping runs in [4GiB-8, MaxUint64), got %v", gotRange)
+	}
+
+	// Punch hole inside [math.MaxUint64-1024, math.MaxUint64) and truncate back to MaxSize.
+	rask.PunchRange(math.MaxUint64-768, math.MaxUint64-256)
+	oracle.PunchRange(math.MaxUint64-768, math.MaxUint64-256)
+	assertRaskMatchesOracle(t, "punch-near-max-uint64", rask, oracle)
+
+	rask.Truncate(MaxSize)
+	oracle.Truncate(MaxSize)
+	assertRaskMatchesOracle(t, "truncate-to-maxsize", rask, oracle)
+}
+
+func TestRASKSplitMergeChurn50k(t *testing.T) {
+	const ops = 50_000
+	rask := NewRaskRunIndex()
+	oracle := NewBaselineRunSlice()
+	rng := rand.New(rand.NewPCG(0x59_C409, 0x1344_2026))
+
+	const clusters = 24
+	const clusterStride = uint64(40) << 40 // 40 TiB apart across ~1 PiB
+
+	for step := range ops {
+		mode := step % 10
+		switch {
+		case mode < 5:
+			// Clustered small insert (compact leaves & leaf splits).
+			c := uint64(rng.IntN(clusters))
+			off := c*clusterStride + uint64(rng.IntN(1<<22))*64
+			length := uint64(32 + rng.IntN(256))
+			rask.InsertRange(off, off+length)
+			oracle.InsertRange(off, off+length)
+		case mode < 7:
+			// Hole punch inside an active cluster (splitting & shrinking leaves).
+			c := uint64(rng.IntN(clusters))
+			off := c*clusterStride + uint64(rng.IntN(1<<22))*64
+			length := uint64(16 + rng.IntN(2048))
+			rask.PunchRange(off, off+length)
+			oracle.PunchRange(off, off+length)
+		case mode == 7:
+			// Cross-leaf coalescing bridge inside a cluster.
+			c := uint64(rng.IntN(clusters))
+			off := c*clusterStride + uint64(rng.IntN(1<<20))*64
+			length := uint64(1 << 16)
+			rask.InsertRange(off, off+length)
+			oracle.InsertRange(off, off+length)
+		case mode == 8:
+			// Wide-leaf promotion (> 4 GiB span within cluster) followed by punch re-compaction.
+			c := uint64(rng.IntN(clusters))
+			wideOff := c*clusterStride + (uint64(5) << 30) + uint64(rng.IntN(1024))*4096
+			rask.InsertRange(wideOff, wideOff+2048)
+			oracle.InsertRange(wideOff, wideOff+2048)
+			if step%40 == 8 {
+				rask.PunchRange(c*clusterStride+(uint64(5)<<30), c*clusterStride+(uint64(5)<<30)+1024*4096+4096)
+				oracle.PunchRange(c*clusterStride+(uint64(5)<<30), c*clusterStride+(uint64(5)<<30)+1024*4096+4096)
+			}
+		default:
+			// Periodic high-offset truncate & re-populate of top cluster.
+			if step%500 == 499 {
+				cut := uint64(clusters-2) * clusterStride
+				rask.Truncate(cut)
+				oracle.Truncate(cut)
+			} else {
+				c := uint64(rng.IntN(clusters))
+				off := c*clusterStride + uint64(rng.IntN(1<<22))*64
+				rask.InsertRange(off, off+64)
+				oracle.InsertRange(off, off+64)
+			}
+		}
+
+		if step%5000 == 4999 || step == ops-1 {
+			assertRaskMatchesOracle(t, fmt.Sprintf("churn-50k-step-%d", step), rask, oracle)
+		}
+	}
+}
+
+func TestRASKProductionFileLayerAdaptiveThresholdParity(t *testing.T) {
+	ctx := context.Background()
+	jDir := raskScratchDir(t)
+	be := storetest.NewMem()
+	ciph := Hybrid(raskTestKey(t))
+
+	if err := Create(ctx, Config{Backend: be, Cipher: ciph}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := Attach(ctx, Config{
+		Backend:         be,
+		Cipher:          ciph,
+		Round:           1,
+		Journal:         jDir,
+		JournalCapacity: 64 << 20,
+		Dirty:           1 << 30,
+		Overlay:         1 << 20,
+		Bound:           time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+
+	in, err := v.Create(ctx, RootInode, "adaptive-rask.bin", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := v.Open(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Reference model for [0, regionSize) plus a high 1 PiB tail region.
+	const regionSize = 2 << 20 // 2 MiB dense region (> small=16KiB so chunked extent path runs)
+	const pibOffset = (uint64(1) << 50) - 65536
+	const totalSize = (uint64(1) << 50)
+	refLow := make([]byte, regionSize)
+	refHigh := make([]byte, 65536)
+
+	for i := range refLow {
+		refLow[i] = byte((i*31 + 17) & 0xff)
+	}
+	for i := range refHigh {
+		refHigh[i] = byte((i*73 + 99) & 0xff)
+	}
+
+	if err := f.Truncate(ctx, totalSize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(ctx, refLow, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(ctx, refHigh, int64(pibOffset)); err != nil {
+		t.Fatal(err)
+	}
+	// Publish settled chunks so subsequent Punch operations populate layer.void -> layer.voidRask.
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Punch 1,200 disjoint holes across the settled 2 MiB region and 1 PiB tail,
+	// crossing raskVoidPromoteThreshold (512).
+	const totalPunches = 1200
+	for i := range totalPunches {
+		off := uint64(i) * 1536
+		const length = 512
+		if off+length <= regionSize {
+			if err := f.Punch(ctx, off, length); err != nil {
+				t.Fatal(err)
+			}
+			clear(refLow[off : off+length])
+		}
+		if i == raskVoidPromoteThreshold-2 {
+			v.mu.RLock()
+			hasRask := f.f.lv.voidRask != nil
+			voidLen := len(f.f.lv.void)
+			v.mu.RUnlock()
+			if hasRask || voidLen != raskVoidPromoteThreshold-1 {
+				t.Fatalf("before threshold: expected flat void slice len=%d, got hasRask=%v len=%d",
+					raskVoidPromoteThreshold-1, hasRask, voidLen)
+			}
+		}
+		if i == raskVoidPromoteThreshold {
+			v.mu.RLock()
+			hasRask := f.f.lv.voidRask != nil
+			flatNil := f.f.lv.void == nil
+			raskLen := f.f.lv.voidLen()
+			v.mu.RUnlock()
+			if !hasRask || !flatNil || raskLen != raskVoidPromoteThreshold+1 {
+				t.Fatalf("at threshold: expected promoted voidRask (len=%d, flatNil=true), got hasRask=%v flatNil=%v len=%d",
+					raskVoidPromoteThreshold+1, hasRask, flatNil, raskLen)
+			}
+		}
+	}
+
+	// Also punch holes in the 1 PiB tail and overwrite a few punched ranges.
+	for i := range 20 {
+		off := uint64(i) * 2048
+		if err := f.Punch(ctx, pibOffset+off, 1024); err != nil {
+			t.Fatal(err)
+		}
+		clear(refHigh[off : off+1024])
+	}
+	patch := []byte("REWRITTEN-OVER-RASK-VOID-HOLE-0123456789ABCDEF")
+	for _, off := range []uint64{1536 + 64, 300*1536 + 128, 900*1536 + 256} {
+		if _, err := f.WriteAt(ctx, patch, int64(off)); err != nil {
+			t.Fatal(err)
+		}
+		copy(refLow[off:], patch)
+	}
+
+	// 1. Verify ReadAt BEFORE Flush (exercises body.plan -> layer.forEachVoid -> voidRask.RangeOverlaps).
+	gotLow := make([]byte, regionSize)
+	if _, err := f.ReadAt(ctx, gotLow, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotLow, refLow) {
+		t.Fatal("ReadAt before Flush differed from reference model in low region")
+	}
+	gotHigh := make([]byte, len(refHigh))
+	if _, err := f.ReadAt(ctx, gotHigh, int64(pibOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotHigh, refHigh) {
+		t.Fatal("ReadAt before Flush differed from reference model at 1 PiB tail")
+	}
+
+	// 2. Flush generation (exercises cut() -> snap.runs() & snap.voided() with s.fz.voidRask).
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Verify ReadAt AFTER Flush on settled extents.
+	clear(gotLow)
+	if _, err := f.ReadAt(ctx, gotLow, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotLow, refLow) {
+		t.Fatal("ReadAt after Flush differed from reference model in low region")
+	}
+	clear(gotHigh)
+	if _, err := f.ReadAt(ctx, gotHigh, int64(pibOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotHigh, refHigh) {
+		t.Fatal("ReadAt after Flush differed from reference model at 1 PiB tail")
+	}
+
+	// 4. Punch 600 more voids to promote again, then Truncate down to 64 KiB (< raskVoidDemoteThreshold = 128)
+	// and verify clean demotion back to flat l.void []run.
+	for i := range 600 {
+		off := uint64(i) * 2048
+		if err := f.Punch(ctx, off, 256); err != nil {
+			t.Fatal(err)
+		}
+		if off+256 <= uint64(len(refLow)) {
+			clear(refLow[off:min(uint64(len(refLow)), off+256)])
+		}
+	}
+	v.mu.RLock()
+	promotedAgain := f.f.lv.voidRask != nil
+	v.mu.RUnlock()
+	if !promotedAgain {
+		t.Fatal("expected voidRask promotion on second punch wave")
+	}
+
+	const truncSize = 64 << 10 // 64 KiB -> only 32 punched runs remain (<= 128 demote threshold)
+	if err := f.Truncate(ctx, truncSize); err != nil {
+		t.Fatal(err)
+	}
+	refLow = refLow[:truncSize]
+
+	v.mu.RLock()
+	demotedToSlice := f.f.lv.voidRask == nil && len(f.f.lv.void) == 32
+	v.mu.RUnlock()
+	if !demotedToSlice {
+		t.Fatalf("expected demotion to flat []run after Truncate(64KiB), got voidRask=%v len(void)=%d",
+			f.f.lv.voidRask != nil, len(f.f.lv.void))
+	}
+
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Reopen read-only Volume from backend store and verify final settled bytes match refLow.
+	ro, err := Open(ctx, Config{Backend: be, Cipher: ciph})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	roFile, err := ro.Open(ctx, in.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer roFile.Close()
+	gotFinal := make([]byte, truncSize)
+	if _, err := roFile.ReadAt(ctx, gotFinal, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotFinal, refLow) {
+		t.Fatal("fresh read-only Volume Open ReadAt differed from reference model after Truncate+Flush")
+	}
 }
 
 func TestRASKBenchmarkSmoke(t *testing.T) {

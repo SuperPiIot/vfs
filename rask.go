@@ -9,9 +9,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -58,14 +61,19 @@ type raskFrame struct {
 }
 
 // RaskStats summarizes the structural layout of a RaskRunIndex.
+//
+// StructuralBytes sums unsafe.Sizeof of structs plus cap(slice)*unsafe.Sizeof(elem)
+// of backing slices; it does NOT include Go runtime size-class rounding, GC span
+// metadata, or process RSS. Use RetainedHeapAllocBytes / RetainedHeapInuseBytes /
+// RSSDeltaBytes in RunRASKBenchmark for allocator and OS memory accounting.
 type RaskStats struct {
-	Runs          int
-	Height        int
-	Leaves        int
-	CompactLeaves int
-	WideLeaves    int
-	InternalNodes int
-	MemoryBytes   int64
+	Runs            int
+	Height          int
+	Leaves          int
+	CompactLeaves   int
+	WideLeaves      int
+	InternalNodes   int
+	StructuralBytes int64
 }
 
 // RaskRunIndex is a compact segmented B+tree range index over disjoint,
@@ -510,6 +518,73 @@ func (idx *RaskRunIndex) Overlaps(a, b uint64) bool {
 	return lo < len(w) && w[lo].a < b
 }
 
+// RangeOverlaps visits in sorted order every run in idx that overlaps [a, b).
+func (idx *RaskRunIndex) RangeOverlaps(a, b uint64, fn func(run)) {
+	if a >= b || idx.count == 0 {
+		return
+	}
+	for l := idx.descendGT(a); l != nil && l.base < b; l = l.next {
+		if !l.isWide() {
+			var relA uint32
+			if a > l.base {
+				relA = uint32(a - l.base)
+			}
+			c := l.compact
+			lo, hi := 0, len(c)
+			for lo < hi {
+				mid := int(uint(lo+hi) >> 1)
+				if c[mid].deltaOff+c[mid].len32 <= relA {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			for k := lo; k < len(c); k++ {
+				ra := l.base + uint64(c[k].deltaOff)
+				if ra >= b {
+					return
+				}
+				fn(run{a: ra, b: ra + uint64(c[k].len32)})
+			}
+			continue
+		}
+		w := l.wide
+		lo, hi := 0, len(w)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if w[mid].b <= a {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		for k := lo; k < len(w); k++ {
+			if w[k].a >= b {
+				return
+			}
+			fn(w[k])
+		}
+	}
+}
+
+// NewRaskRunIndexFromSorted builds a RaskRunIndex from an already sorted,
+// disjoint, non-touching slice of runs.
+func NewRaskRunIndexFromSorted(runs []run) *RaskRunIndex {
+	idx := NewRaskRunIndex()
+	for _, r := range runs {
+		idx.InsertRange(r.a, r.b)
+	}
+	return idx
+}
+
+// Clone returns an independent deep copy of idx.
+func (idx *RaskRunIndex) Clone() *RaskRunIndex {
+	if idx == nil {
+		return nil
+	}
+	return NewRaskRunIndexFromSorted(idx.AllRuns())
+}
+
 // AllRuns returns all runs in sorted order.
 func (idx *RaskRunIndex) AllRuns() []run {
 	if idx.count == 0 {
@@ -529,12 +604,16 @@ func (idx *RaskRunIndex) AllRuns() []run {
 	return out
 }
 
-// Stats returns structural counts and exact MemoryBytes of idx.
+// Stats returns structural counts and exact StructuralBytes of idx.
+//
+// StructuralBytes sums unsafe.Sizeof of structs and cap(slice)*unsafe.Sizeof(elem)
+// of backing slices; it does not include Go runtime size-class rounding or GC
+// heap metadata.
 func (idx *RaskRunIndex) Stats() RaskStats {
 	st := RaskStats{
-		Runs:        idx.count,
-		Height:      idx.height,
-		MemoryBytes: int64(unsafe.Sizeof(*idx)),
+		Runs:            idx.count,
+		Height:          idx.height,
+		StructuralBytes: int64(unsafe.Sizeof(*idx)),
 	}
 	for l := idx.first; l != nil; l = l.next {
 		st.Leaves++
@@ -543,9 +622,9 @@ func (idx *RaskRunIndex) Stats() RaskStats {
 		} else {
 			st.CompactLeaves++
 		}
-		st.MemoryBytes += int64(unsafe.Sizeof(*l))
-		st.MemoryBytes += int64(cap(l.compact)) * int64(unsafe.Sizeof(compactRun{}))
-		st.MemoryBytes += int64(cap(l.wide)) * int64(unsafe.Sizeof(run{}))
+		st.StructuralBytes += int64(unsafe.Sizeof(*l))
+		st.StructuralBytes += int64(cap(l.compact)) * int64(unsafe.Sizeof(compactRun{}))
+		st.StructuralBytes += int64(cap(l.wide)) * int64(unsafe.Sizeof(run{}))
 	}
 	if idx.root != nil {
 		st.addInternalStats(idx.root, idx.height)
@@ -555,10 +634,10 @@ func (idx *RaskRunIndex) Stats() RaskStats {
 
 func (st *RaskStats) addInternalStats(n *raskInternal, level int) {
 	st.InternalNodes++
-	st.MemoryBytes += int64(unsafe.Sizeof(*n))
-	st.MemoryBytes += int64(cap(n.maxEnds)) * int64(unsafe.Sizeof(uint64(0)))
-	st.MemoryBytes += int64(cap(n.leaves)) * int64(unsafe.Sizeof((*raskLeaf)(nil)))
-	st.MemoryBytes += int64(cap(n.internals)) * int64(unsafe.Sizeof((*raskInternal)(nil)))
+	st.StructuralBytes += int64(unsafe.Sizeof(*n))
+	st.StructuralBytes += int64(cap(n.maxEnds)) * int64(unsafe.Sizeof(uint64(0)))
+	st.StructuralBytes += int64(cap(n.leaves)) * int64(unsafe.Sizeof((*raskLeaf)(nil)))
+	st.StructuralBytes += int64(cap(n.internals)) * int64(unsafe.Sizeof((*raskInternal)(nil)))
 	if level > 1 {
 		for _, ch := range n.internals {
 			st.addInternalStats(ch, level-1)
@@ -566,9 +645,18 @@ func (st *RaskStats) addInternalStats(n *raskInternal, level int) {
 	}
 }
 
-// MemoryBytes returns exact allocated in-memory byte usage of idx.
+// StructuralBytes returns the structural byte footprint (sizeof structs +
+// cap(slice)*sizeof(elem)) of idx, excluding Go allocator size-class rounding
+// and GC overhead.
+func (idx *RaskRunIndex) StructuralBytes() int64 {
+	return idx.Stats().StructuralBytes
+}
+
+// MemoryBytes is an alias for StructuralBytes kept for caller compatibility.
+// It returns structural sizeof + slice-cap bytes, NOT Go allocator size-class
+// rounding or GC heap overhead.
 func (idx *RaskRunIndex) MemoryBytes() int64 {
-	return idx.Stats().MemoryBytes
+	return idx.Stats().StructuralBytes
 }
 
 // InsertRange adds [a, b) into the index, coalescing overlapping or adjacent runs.
@@ -1504,9 +1592,18 @@ func NewBaselineRunSlice() *BaselineRunSlice {
 // Len returns the number of disjoint coalesced runs currently stored.
 func (b *BaselineRunSlice) Len() int { return len(b.runs) }
 
-// MemoryBytes returns exact allocated in-memory byte usage of b.
-func (b *BaselineRunSlice) MemoryBytes() int64 {
+// StructuralBytes returns the structural byte footprint (sizeof struct +
+// cap(runs)*sizeof(run)) of b, excluding Go allocator size-class rounding and
+// GC heap metadata.
+func (b *BaselineRunSlice) StructuralBytes() int64 {
 	return int64(unsafe.Sizeof(*b)) + int64(cap(b.runs))*int64(unsafe.Sizeof(run{}))
+}
+
+// MemoryBytes is an alias for StructuralBytes kept for caller compatibility.
+// It returns structural sizeof + slice-cap bytes, NOT Go allocator size-class
+// rounding or GC heap overhead.
+func (b *BaselineRunSlice) MemoryBytes() int64 {
+	return b.StructuralBytes()
 }
 
 // AllRuns returns a copy of all runs in sorted order.
@@ -1617,35 +1714,44 @@ type RASKBenchmarkConfig struct {
 	Short bool
 }
 
-// RASKWorkloadResult captures measured memory and timing metrics for one regime
-// comparing BaselineRunSlice against RaskRunIndex.
+// RASKWorkloadResult captures measured structural, retained heap, RSS, CPU, GC,
+// and timing metrics for one regime comparing BaselineRunSlice against RaskRunIndex.
 type RASKWorkloadResult struct {
-	Category          string  `json:"category"` // "real_volume_journal_replay" or "synthetic_microbenchmark"
-	Name              string  `json:"name"`
-	Description       string  `json:"description"`
-	Ops               int     `json:"ops"`
-	FinalRuns         int     `json:"final_runs"`
-	CompactLeaves     int     `json:"compact_leaves"`
-	WideLeaves        int     `json:"wide_leaves"`
-	BaselineStructB   int64   `json:"baseline_struct_bytes"`
-	BaselineHeapB     int64   `json:"baseline_heap_bytes"`
-	BaselineBPerRun   float64 `json:"baseline_bytes_per_run"`
-	RaskStructB       int64   `json:"rask_struct_bytes"`
-	RaskHeapB         int64   `json:"rask_heap_bytes"`
-	RaskBPerRun       float64 `json:"rask_bytes_per_run"`
-	MemSavingsPct     float64 `json:"mem_savings_pct"`
-	BaselineBuildMs   float64 `json:"baseline_build_ms"`
-	RaskBuildMs       float64 `json:"rask_build_ms"`
-	BaselineQueryNs   float64 `json:"baseline_query_mean_ns"`
-	BaselineP50Ns     float64 `json:"baseline_query_p50_ns"`
-	BaselineP99Ns     float64 `json:"baseline_query_p99_ns"`
-	RaskQueryNs       float64 `json:"rask_query_mean_ns"`
-	RaskP50Ns         float64 `json:"rask_query_p50_ns"`
-	RaskP99Ns         float64 `json:"rask_query_p99_ns"`
-	BaselineOverlapNs float64 `json:"baseline_overlap_mean_ns"`
-	RaskOverlapNs     float64 `json:"rask_overlap_mean_ns"`
-	ExactMatch        bool    `json:"exact_match"`
-	TradeOffNote      string  `json:"trade_off_note"`
+	Category                       string  `json:"category"` // "real_volume_journal_replay" or "synthetic_microbenchmark"
+	Name                           string  `json:"name"`
+	Description                    string  `json:"description"`
+	Ops                            int     `json:"ops"`
+	FinalRuns                      int     `json:"final_runs"`
+	CompactLeaves                  int     `json:"compact_leaves"`
+	WideLeaves                     int     `json:"wide_leaves"`
+	BaselineStructuralBytes        int64   `json:"baseline_structural_bytes"`
+	BaselineStructuralBytesPerRun  float64 `json:"baseline_structural_bytes_per_run"`
+	BaselineRetainedHeapAllocBytes int64   `json:"baseline_retained_heap_alloc_bytes"`
+	BaselineRetainedHeapInuseBytes int64   `json:"baseline_retained_heap_inuse_bytes"`
+	BaselineRSSDeltaBytes          int64   `json:"baseline_rss_delta_bytes"`
+	BaselineCPUTimeMs              float64 `json:"baseline_cpu_time_ms"`
+	BaselineGCCycles               uint32  `json:"baseline_gc_cycles"`
+	RaskStructuralBytes            int64   `json:"rask_structural_bytes"`
+	RaskStructuralBytesPerRun      float64 `json:"rask_structural_bytes_per_run"`
+	RaskRetainedHeapAllocBytes     int64   `json:"rask_retained_heap_alloc_bytes"`
+	RaskRetainedHeapInuseBytes     int64   `json:"rask_retained_heap_inuse_bytes"`
+	RaskRSSDeltaBytes              int64   `json:"rask_rss_delta_bytes"`
+	RaskCPUTimeMs                  float64 `json:"rask_cpu_time_ms"`
+	RaskGCCycles                   uint32  `json:"rask_gc_cycles"`
+	StructuralSavingsPct           float64 `json:"structural_savings_pct"`
+	HeapAllocSavingsPct            float64 `json:"heap_alloc_savings_pct"`
+	BaselineBuildMs                float64 `json:"baseline_build_ms"`
+	RaskBuildMs                    float64 `json:"rask_build_ms"`
+	BaselineQueryNs                float64 `json:"baseline_query_mean_ns"`
+	BaselineP50Ns                  float64 `json:"baseline_query_p50_ns"`
+	BaselineP99Ns                  float64 `json:"baseline_query_p99_ns"`
+	RaskQueryNs                    float64 `json:"rask_query_mean_ns"`
+	RaskP50Ns                      float64 `json:"rask_query_p50_ns"`
+	RaskP99Ns                      float64 `json:"rask_query_p99_ns"`
+	BaselineOverlapNs              float64 `json:"baseline_overlap_mean_ns"`
+	RaskOverlapNs                  float64 `json:"rask_overlap_mean_ns"`
+	ExactMatch                     bool    `json:"exact_match"`
+	TradeOffNote                   string  `json:"trade_off_note"`
 }
 
 // RASKJournalReplayMetadata records details from the real vfs.Volume journal
@@ -2021,16 +2127,35 @@ func runRealJournalReplayWorkload(
 	return res, jMeta, nil
 }
 
+func processRSSBytes() int64 {
+	raw, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(raw))
+	if len(fields) < 2 {
+		return 0
+	}
+	pages, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || pages <= 0 {
+		return 0
+	}
+	return pages * int64(os.Getpagesize())
+}
+
 func measureSyntheticWorkload(
 	category, name, desc, note string,
 	ops []raskOp,
 	qOffs []uint64,
 	qRanges [][2]uint64,
 ) (RASKWorkloadResult, error) {
+	// Measure BaselineRunSlice in an isolated forced-GC window.
 	runtime.GC()
 	runtime.GC()
 	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
+	rssBase0 := processRSSBytes()
+	cpuBase0 := processCPUTimeNs()
 	base := NewBaselineRunSlice()
 	tBase := time.Now()
 	for _, op := range ops {
@@ -2044,19 +2169,33 @@ func measureSyntheticWorkload(
 		}
 	}
 	baseBuildMs := float64(time.Since(tBase).Nanoseconds()) / 1e6
+	cpuBase1 := processCPUTimeNs()
+	var mBuild1 runtime.MemStats
+	runtime.ReadMemStats(&mBuild1)
+	baseGCCycles := mBuild1.NumGC - m0.NumGC
 	runtime.GC()
 	runtime.GC()
 	runtime.ReadMemStats(&m1)
-	baseHeap := int64(m1.HeapAlloc) - int64(m0.HeapAlloc)
-	if baseHeap < 0 {
-		baseHeap = 0
-	}
-	baseStruct := base.MemoryBytes()
+	rssBase1 := processRSSBytes()
+	baseHeapAlloc := max(int64(0), int64(m1.HeapAlloc)-int64(m0.HeapAlloc))
+	baseHeapInuse := max(int64(0), int64(m1.HeapInuse)-int64(m0.HeapInuse))
+	baseRSSDelta := max(int64(0), rssBase1-rssBase0)
+	baseCPUTimeMs := float64(max(int64(0), cpuBase1-cpuBase0)) / 1e6
+	baseStruct := base.StructuralBytes()
 
+	bMean, bP50, bP99 := benchPointLookups(base.Contains, qOffs)
+	bOvMean := benchRangeLookups(base.Overlaps, qRanges)
+	baseRuns := base.AllRuns()
+	runtime.KeepAlive(base)
+	base = nil
+
+	// Measure RaskRunIndex in an isolated forced-GC window after releasing base.
 	runtime.GC()
 	runtime.GC()
 	var r0, r1 runtime.MemStats
 	runtime.ReadMemStats(&r0)
+	rssRask0 := processRSSBytes()
+	cpuRask0 := processCPUTimeNs()
 	rask := NewRaskRunIndex()
 	tRask := time.Now()
 	for _, op := range ops {
@@ -2070,17 +2209,23 @@ func measureSyntheticWorkload(
 		}
 	}
 	raskBuildMs := float64(time.Since(tRask).Nanoseconds()) / 1e6
+	cpuRask1 := processCPUTimeNs()
+	var rBuild1 runtime.MemStats
+	runtime.ReadMemStats(&rBuild1)
+	raskGCCycles := rBuild1.NumGC - r0.NumGC
 	runtime.GC()
 	runtime.GC()
 	runtime.ReadMemStats(&r1)
-	raskHeap := int64(r1.HeapAlloc) - int64(r0.HeapAlloc)
-	if raskHeap < 0 {
-		raskHeap = 0
-	}
+	rssRask1 := processRSSBytes()
+	raskHeapAlloc := max(int64(0), int64(r1.HeapAlloc)-int64(r0.HeapAlloc))
+	raskHeapInuse := max(int64(0), int64(r1.HeapInuse)-int64(r0.HeapInuse))
+	raskRSSDelta := max(int64(0), rssRask1-rssRask0)
+	raskCPUTimeMs := float64(max(int64(0), cpuRask1-cpuRask0)) / 1e6
 	raskStats := rask.Stats()
-	raskStruct := raskStats.MemoryBytes
+	raskStruct := raskStats.StructuralBytes
 
-	baseRuns := base.AllRuns()
+	rMean, rP50, rP99 := benchPointLookups(rask.Contains, qOffs)
+	rOvMean := benchRangeLookups(rask.Overlaps, qRanges)
 	raskRuns := rask.AllRuns()
 	exact := slices.Equal(baseRuns, raskRuns)
 	if !exact {
@@ -2089,47 +2234,53 @@ func measureSyntheticWorkload(
 	if err := rask.verifyInvariants(); err != nil {
 		return RASKWorkloadResult{}, fmt.Errorf("%s: invariant violation: %w", name, err)
 	}
-
-	bMean, bP50, bP99 := benchPointLookups(base.Contains, qOffs)
-	rMean, rP50, rP99 := benchPointLookups(rask.Contains, qOffs)
-	bOvMean := benchRangeLookups(base.Overlaps, qRanges)
-	rOvMean := benchRangeLookups(rask.Overlaps, qRanges)
-
-	runtime.KeepAlive(base)
 	runtime.KeepAlive(rask)
 
 	n := max(1, len(baseRuns))
 	baseBPerRun := float64(baseStruct) / float64(n)
 	raskBPerRun := float64(raskStruct) / float64(n)
-	savingsPct := (1.0 - raskBPerRun/baseBPerRun) * 100.0
+	structSavingsPct := (1.0 - raskBPerRun/baseBPerRun) * 100.0
+	var heapSavingsPct float64
+	if baseHeapAlloc > 0 {
+		heapSavingsPct = (1.0 - float64(raskHeapAlloc)/float64(baseHeapAlloc)) * 100.0
+	}
 
 	return RASKWorkloadResult{
-		Category:          category,
-		Name:              name,
-		Description:       desc,
-		Ops:               len(ops),
-		FinalRuns:         len(baseRuns),
-		CompactLeaves:     raskStats.CompactLeaves,
-		WideLeaves:        raskStats.WideLeaves,
-		BaselineStructB:   baseStruct,
-		BaselineHeapB:     baseHeap,
-		BaselineBPerRun:   baseBPerRun,
-		RaskStructB:       raskStruct,
-		RaskHeapB:         raskHeap,
-		RaskBPerRun:       raskBPerRun,
-		MemSavingsPct:     savingsPct,
-		BaselineBuildMs:   baseBuildMs,
-		RaskBuildMs:       raskBuildMs,
-		BaselineQueryNs:   bMean,
-		BaselineP50Ns:     bP50,
-		BaselineP99Ns:     bP99,
-		RaskQueryNs:       rMean,
-		RaskP50Ns:         rP50,
-		RaskP99Ns:         rP99,
-		BaselineOverlapNs: bOvMean,
-		RaskOverlapNs:     rOvMean,
-		ExactMatch:        exact,
-		TradeOffNote:      note,
+		Category:                       category,
+		Name:                           name,
+		Description:                    desc,
+		Ops:                            len(ops),
+		FinalRuns:                      len(baseRuns),
+		CompactLeaves:                  raskStats.CompactLeaves,
+		WideLeaves:                     raskStats.WideLeaves,
+		BaselineStructuralBytes:        baseStruct,
+		BaselineStructuralBytesPerRun:  baseBPerRun,
+		BaselineRetainedHeapAllocBytes: baseHeapAlloc,
+		BaselineRetainedHeapInuseBytes: baseHeapInuse,
+		BaselineRSSDeltaBytes:          baseRSSDelta,
+		BaselineCPUTimeMs:              baseCPUTimeMs,
+		BaselineGCCycles:               baseGCCycles,
+		RaskStructuralBytes:            raskStruct,
+		RaskStructuralBytesPerRun:      raskBPerRun,
+		RaskRetainedHeapAllocBytes:     raskHeapAlloc,
+		RaskRetainedHeapInuseBytes:     raskHeapInuse,
+		RaskRSSDeltaBytes:              raskRSSDelta,
+		RaskCPUTimeMs:                  raskCPUTimeMs,
+		RaskGCCycles:                   raskGCCycles,
+		StructuralSavingsPct:           structSavingsPct,
+		HeapAllocSavingsPct:            heapSavingsPct,
+		BaselineBuildMs:                baseBuildMs,
+		RaskBuildMs:                    raskBuildMs,
+		BaselineQueryNs:                bMean,
+		BaselineP50Ns:                  bP50,
+		BaselineP99Ns:                  bP99,
+		RaskQueryNs:                    rMean,
+		RaskP50Ns:                      rP50,
+		RaskP99Ns:                      rP99,
+		BaselineOverlapNs:              bOvMean,
+		RaskOverlapNs:                  rOvMean,
+		ExactMatch:                     exact,
+		TradeOffNote:                   note,
 	}, nil
 }
 
