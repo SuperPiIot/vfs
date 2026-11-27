@@ -1,0 +1,7 @@
+category,workload,ops,final_runs,compact_leaves,wide_leaves,baseline_struct_bytes,baseline_heap_bytes,baseline_b_per_run,rask_struct_bytes,rask_heap_bytes,rask_b_per_run,mem_savings_pct,baseline_build_ms,rask_build_ms,baseline_query_mean_ns,baseline_query_p50_ns,baseline_query_p99_ns,rask_query_mean_ns,rask_query_p50_ns,rask_query_p99_ns,baseline_overlap_mean_ns,rask_overlap_mean_ns,exact_match
+real_volume_journal_replay,real_journal_replay_1pib,2743,2743,16,0,57368,0,20.91,23928,23888,8.72,58.29,10.958,1.401,94.32,91.38,122.20,196.77,91.95,1837.12,364.47,473.04,true
+synthetic_microbenchmark,synth_clustered_seq_1pib,50000,50000,200,0,950296,950272,19.01,429224,429232,8.58,54.83,10.244,38.062,360.96,83.86,312.48,211.64,93.17,1974.59,218.58,194.84,true
+synthetic_microbenchmark,synth_clustered_rand_1pib,60000,60000,401,0,1196056,1196032,19.93,541112,541136,9.02,54.76,2893.822,69.408,192.53,187.02,297.16,309.34,199.19,442.78,217.21,283.76,true
+synthetic_microbenchmark,synth_strided_sub4g_1pib,50000,50000,196,0,950296,950272,19.01,419368,419376,8.39,55.87,15.443,10.628,97.86,83.80,351.62,100.51,90.16,269.05,166.85,118.31,true
+synthetic_microbenchmark,synth_strided_gt4g_1pib,50000,50000,0,391,950296,950272,19.01,838808,838864,16.78,11.73,7.112,16.195,85.15,82.92,95.84,96.02,89.62,105.42,102.31,98.70,true
+synthetic_microbenchmark,synth_small_n_seq,128,128,1,0,2072,2048,16.19,1136,1088,8.88,45.17,0.027,0.038,97.88,35.25,1618.17,92.62,36.27,1565.81,24.82,35.45,true
