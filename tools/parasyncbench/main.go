@@ -130,6 +130,9 @@ type benchRow struct {
 	FullSnapshotBytes  int64   `json:"full_snapshot_bytes"`
 	BytesTransferred   int64   `json:"bytes_transferred"`
 	BytesSavedPct      float64 `json:"bytes_saved_pct"`
+	VerifyBytesRead    int64   `json:"verify_bytes_read"`
+	VerifyGets         int64   `json:"verify_gets"`
+	ChunksVerified     int     `json:"chunks_verified"`
 	ShardsCopied       int     `json:"shards_copied"`
 	ShardsPruned       int     `json:"shards_pruned"`
 	TotalSourceShards  int     `json:"total_source_shards"`
@@ -509,6 +512,9 @@ func runMode(ctx context.Context, scratch string, fx *workloadFixture, beKind st
 		FullSnapshotBytes:  stats.FullSnapshotBytes,
 		BytesTransferred:   stats.BytesTransferred,
 		BytesSavedPct:      savedPct,
+		VerifyBytesRead:    stats.VerifyBytesRead,
+		VerifyGets:         stats.VerifyGets,
+		ChunksVerified:     stats.ChunksVerified,
 		ShardsCopied:       stats.ShardsCopied,
 		ShardsPruned:       stats.Plan.ShardsPruned,
 		TotalSourceShards:  stats.Plan.TotalSourceShards,
@@ -537,6 +543,7 @@ func writeCSV(path string, rows []benchRow) error {
 	header := []string{
 		"workload", "backend", "mode", "streams", "simulated_rtt_ms",
 		"files", "logical_mb", "full_snapshot_bytes", "bytes_transferred", "bytes_saved_pct",
+		"verify_bytes_read", "verify_gets", "chunks_verified",
 		"shards_copied", "shards_pruned", "total_source_shards",
 		"packs_copied", "packs_pruned", "total_source_packs",
 		"source_gets", "dest_puts", "dest_stats", "total_backend_ops",
@@ -557,6 +564,9 @@ func writeCSV(path string, rows []benchRow) error {
 			strconv.FormatInt(r.FullSnapshotBytes, 10),
 			strconv.FormatInt(r.BytesTransferred, 10),
 			fmt.Sprintf("%.2f", r.BytesSavedPct),
+			strconv.FormatInt(r.VerifyBytesRead, 10),
+			strconv.FormatInt(r.VerifyGets, 10),
+			strconv.Itoa(r.ChunksVerified),
 			strconv.Itoa(r.ShardsCopied),
 			strconv.Itoa(r.ShardsPruned),
 			strconv.Itoa(r.TotalSourceShards),
@@ -686,12 +696,13 @@ func main() {
 	fmt.Printf("ParaSync Parallel Delta Restore Benchmark (HIP-1344, Bounty #64)\n")
 	fmt.Printf("================================================================\n")
 	fmt.Printf("Parallel streams: %d | Go: %s | GOMAXPROCS: %d\n\n", *streams, runtime.Version(), runtime.GOMAXPROCS(0))
-	fmt.Printf("| Workload | Backend | Mode | Streams | SimRTT(ms) | Transferred / Full (B) | Saved%% | Shards(C/P) | Packs(C/P) | SrcGets | Ops | Wall(ms) | CPU(ms) | PeakG |\n")
-	fmt.Printf("|---|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|\n")
+	fmt.Printf("| Workload | Backend | Mode | Streams | SimRTT(ms) | Transferred / Full (B) | Saved%% | VerifyRead(B) | VerifyGets | ChunksVer | Shards(C/P) | Packs(C/P) | SrcGets | Ops | Wall(ms) | CPU(ms) | PeakG |\n")
+	fmt.Printf("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|\n")
 	for _, r := range rows {
-		fmt.Printf("| %s | %s | %s | %d | %.1f | %d / %d | %.1f%% | %d/%d | %d/%d | %d | %d | %.2f | %.2f | %d |\n",
+		fmt.Printf("| %s | %s | %s | %d | %.1f | %d / %d | %.1f%% | %d | %d | %d | %d/%d | %d/%d | %d | %d | %.2f | %.2f | %d |\n",
 			r.Workload, r.Backend, r.Mode, r.Streams, r.SimulatedRTTMs,
 			r.BytesTransferred, r.FullSnapshotBytes, r.BytesSavedPct,
+			r.VerifyBytesRead, r.VerifyGets, r.ChunksVerified,
 			r.ShardsCopied, r.ShardsPruned, r.PacksCopied, r.PacksPruned,
 			r.SourceGets, r.TotalBackendOps, r.WallMs, r.CPUMs, r.PeakGoroutines)
 	}

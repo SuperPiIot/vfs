@@ -6,7 +6,9 @@
 package vfs
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,12 +26,20 @@ import (
 	"github.com/hanzoai/vfs/pkg/fence"
 )
 
+// ErrSourceCheckpointGCed is returned when a shard or pack required by the
+// source checkpoint disappears from source during planning or transfer (for
+// example, due to concurrent source checkpoint garbage collection). It wraps
+// both ErrCorrupt and backend.ErrNotFound, and leaves destination untouched.
+var ErrSourceCheckpointGCed = fmt.Errorf("vfs: source checkpoint object was garbage-collected during restore (%w: %w)", ErrCorrupt, backend.ErrNotFound)
+
 const (
 	defaultParaSyncStreams = 8
 	// maxParaSyncStagedShardBytes bounds how many unpruned source shard ciphertexts
 	// RestoreDelta keeps in memory between planning and destination upload so small
 	// and medium restores avoid double-fetching shards without unbounded RAM growth.
 	maxParaSyncStagedShardBytes = 128 << 20
+	paraSyncExtName             = "parasync"
+	paraSyncReceiptMagic        = "HNZPRCPT1"
 )
 
 // DeltaPlan describes the verified minimal object-level transfer required to
@@ -59,22 +69,38 @@ type RestoreOptions struct {
 	Round uint64
 	// Streams bounds concurrent backend GET/Stat/PutIfAbsent operations (default 8).
 	Streams int
+	// SaveVerifyReceipt writes a Cipher-sealed integrity receipt under
+	// ext/parasync/<keyed-hash> after end-to-end chunk verification succeeds,
+	// binding (packID, dstVersion, packSize) under the Volume's Cipher.
+	SaveVerifyReceipt bool
+	// TrustSealedReceipt allows verifyRestoredTree to reuse a previously written
+	// Cipher-sealed ext/parasync/<keyed-hash> receipt for unchanged destination
+	// packs whose backend Version and size still match. When false (the default),
+	// every referenced chunk is read from dst, unsealed with chunkAAD, and hashed
+	// with BLAKE3 before Head CAS.
+	TrustSealedReceipt bool
 }
 
-// RestoreStats reports measured counts, transferred bytes, resource usage, and
-// timings from a RestoreDelta execution.
+// RestoreStats reports measured counts, transferred bytes, verification traffic,
+// resource usage, and timings from a RestoreDelta execution.
 type RestoreStats struct {
-	Plan              DeltaPlan
-	ShardsCopied      int
-	PacksCopied       int
-	BytesTransferred  int64
-	FullSnapshotBytes int64
-	SourceGets        int64
-	DestPuts          int64
-	DestStats         int64
-	Duration          time.Duration
-	CPUTime           time.Duration
-	PeakGoroutines    int
+	Plan                 DeltaPlan
+	ShardsCopied         int
+	PacksCopied          int
+	BytesTransferred     int64
+	FullSnapshotBytes    int64
+	SourceGets           int64
+	DestPuts             int64
+	DestStats            int64
+	VerifyBytesRead      int64
+	VerifyGets           int64
+	ChunksVerified       int
+	ReceiptsVerified     int
+	DestGCRecoveredPacks int
+	LostHeadACKRecovered bool
+	Duration             time.Duration
+	CPUTime              time.Duration
+	PeakGoroutines       int
 }
 
 // parasyncCountingBackend wraps a backend.Backend to measure real storage calls
@@ -231,6 +257,7 @@ func RestoreDelta(ctx context.Context, src, dst backend.Backend, c Cipher, opts 
 		packsCopied      atomic.Int64
 		shardsCopied     atomic.Int64
 		bytesTransferred atomic.Int64
+		gcRecoveredPacks atomic.Int64
 	)
 
 	// Canonical VFS write order (LLM.md Rule 3): packs first, then shards, then head.
@@ -240,7 +267,7 @@ func RestoreDelta(ctx context.Context, src, dst backend.Backend, c Cipher, opts 
 		data, _, err := srcCount.Get(wctx, pk, expectedSize)
 		if err != nil {
 			if errors.Is(err, backend.ErrNotFound) {
-				return fmt.Errorf("%w: source pack %s is missing", ErrCorrupt, pk)
+				return fmt.Errorf("%w: source pack %s is missing", ErrSourceCheckpointGCed, pk)
 			}
 			return fmt.Errorf("vfs: read source pack %s: %w", pk, err)
 		}
@@ -284,7 +311,7 @@ func RestoreDelta(ctx context.Context, src, dst backend.Backend, c Cipher, opts 
 			sealed, _, err = srcCount.Get(wctx, sk, maxShard)
 			if err != nil {
 				if errors.Is(err, backend.ErrNotFound) {
-					return fmt.Errorf("%w: source shard %x is missing", ErrCorrupt, r[:6])
+					return fmt.Errorf("%w: source shard %x is missing", ErrSourceCheckpointGCed, r[:6])
 				}
 				return fmt.Errorf("vfs: read source shard %x: %w", r[:6], err)
 			}
@@ -319,10 +346,27 @@ func RestoreDelta(ctx context.Context, src, dst backend.Backend, c Cipher, opts 
 	// Release staged shard ciphertexts before verifying destination.
 	ext.stagedShards = nil
 
-	if err := verifyRestoredTree(ctx, dstCount, c, plan.SrcHead, streams, &peakG); err != nil {
+	dstVerifyCount := newParaSyncCountingBackend(dst)
+	vOutcome, err := verifyRestoredTree(
+		ctx,
+		srcCount,
+		dstCount,
+		dstVerifyCount,
+		c,
+		plan.SrcHead,
+		streams,
+		opts,
+		&packsCopied,
+		&shardsCopied,
+		&bytesTransferred,
+		&gcRecoveredPacks,
+		&peakG,
+	)
+	if err != nil {
 		return nil, err
 	}
 
+	var lostHeadACKRecovered bool
 	dstFence := fence.New(dstCount, maxHead)
 	if err := dstFence.Rewrite(ctx, headKey, opts.Round, func(payload []byte, recorded uint64) ([]byte, error) {
 		if payload != nil {
@@ -346,22 +390,32 @@ func RestoreDelta(ctx context.Context, src, dst backend.Backend, c Cipher, opts 
 		}
 		return seal(c, headAAD(dstCount.String()), plan.SrcHead.marshal())
 	}); err != nil {
-		return nil, err
+		if parasyncHeadLanded(ctx, dstFence, dstCount.String(), c, plan.SrcHead, opts.Round) {
+			lostHeadACKRecovered = true
+		} else {
+			return nil, err
+		}
 	}
 
 	recordPeakGoroutines(&peakG)
 	return &RestoreStats{
-		Plan:              *plan,
-		ShardsCopied:      int(shardsCopied.Load()),
-		PacksCopied:       int(packsCopied.Load()),
-		BytesTransferred:  bytesTransferred.Load(),
-		FullSnapshotBytes: plan.FullSnapshotBytes,
-		SourceGets:        srcCount.gets.Load(),
-		DestPuts:          dstCount.puts.Load(),
-		DestStats:         dstCount.stats.Load(),
-		Duration:          time.Since(startWall),
-		CPUTime:           parasyncProcessCPU() - startCPU,
-		PeakGoroutines:    int(peakG.Load()),
+		Plan:                 *plan,
+		ShardsCopied:         int(shardsCopied.Load()),
+		PacksCopied:          int(packsCopied.Load()),
+		BytesTransferred:     bytesTransferred.Load(),
+		FullSnapshotBytes:    plan.FullSnapshotBytes,
+		SourceGets:           srcCount.gets.Load(),
+		DestPuts:             dstCount.puts.Load(),
+		DestStats:            dstCount.stats.Load(),
+		VerifyBytesRead:      dstVerifyCount.bytesRead.Load(),
+		VerifyGets:           dstVerifyCount.gets.Load() + dstVerifyCount.getRanges.Load(),
+		ChunksVerified:       vOutcome.chunksVerified,
+		ReceiptsVerified:     vOutcome.receiptsVerified,
+		DestGCRecoveredPacks: int(gcRecoveredPacks.Load()),
+		LostHeadACKRecovered: lostHeadACKRecovered,
+		Duration:             time.Since(startWall),
+		CPUTime:              parasyncProcessCPU() - startCPU,
+		PeakGoroutines:       int(peakG.Load()),
 	}, nil
 }
 
@@ -470,7 +524,7 @@ func planDelta(ctx context.Context, src, dst backend.Backend, c Cipher, streams 
 			srcSz, serr := src.Stat(wctx, ch.key)
 			if serr != nil {
 				if errors.Is(serr, backend.ErrNotFound) {
-					return fmt.Errorf("%w: pack %x is missing from source", ErrCorrupt, ch.id[:6])
+					return fmt.Errorf("%w: pack %x is missing from source", ErrSourceCheckpointGCed, ch.id[:6])
 				}
 				return fmt.Errorf("vfs: stat source pack %s: %w", ch.key, serr)
 			}
@@ -671,7 +725,7 @@ func collectSourceDelta(
 			sealed, _, err := src.Get(wctx, sk, maxShard)
 			if err != nil {
 				if errors.Is(err, backend.ErrNotFound) {
-					return fmt.Errorf("%w: source shard %x is missing", ErrCorrupt, it.r[:6])
+					return fmt.Errorf("%w: source shard %x is missing", ErrSourceCheckpointGCed, it.r[:6])
 				}
 				return fmt.Errorf("vfs: read source shard %x: %w", it.r[:6], err)
 			}
@@ -794,13 +848,40 @@ func extractLeafPacks(n *node) (map[packID]uint64, error) {
 	return packs, nil
 }
 
-// verifyRestoredTree warms verifyVol's shard cache in parallel from dst and runs
-// checkTree(ctx, true) to enforce every canonical tree and pack invariant before
-// updating destination head.
-func verifyRestoredTree(ctx context.Context, dst backend.Backend, c Cipher, head Head, streams int, peakG *atomic.Int64) error {
-	vCfg, err := Config{Backend: dst, Cipher: c, Streams: streams}.valid()
+type verifyOutcome struct {
+	chunksVerified   int
+	receiptsVerified int
+}
+
+type parasyncChunkEntry struct {
+	id where
+	ch chunkID
+}
+
+// verifyRestoredTree warms verifyVol's shard cache in parallel from dst, re-fetches
+// any pruned shard or pack concurrently deleted by destination GC from src, runs
+// checkTree(ctx, true) to enforce every canonical tree and metadata invariant, and
+// cryptographically verifies every referenced chunk in every pack against
+// unseal(c, chunkAAD(head.ID, id), frame) and sumChunk(plain) == id (or an opted-in
+// Cipher-sealed ext/parasync/... integrity receipt) before updating destination head.
+func verifyRestoredTree(
+	ctx context.Context,
+	srcCount *parasyncCountingBackend,
+	dstTransferCount *parasyncCountingBackend,
+	dstVerifyCount *parasyncCountingBackend,
+	c Cipher,
+	head Head,
+	streams int,
+	opts RestoreOptions,
+	packsCopied *atomic.Int64,
+	shardsCopied *atomic.Int64,
+	bytesTransferred *atomic.Int64,
+	gcRecoveredPacks *atomic.Int64,
+	peakG *atomic.Int64,
+) (verifyOutcome, error) {
+	vCfg, err := Config{Backend: dstVerifyCount, Cipher: c, Streams: streams}.valid()
 	if err != nil {
-		return err
+		return verifyOutcome{}, err
 	}
 	verifyVol := newVolume(vCfg)
 	defer verifyVol.stop()
@@ -813,17 +894,43 @@ func verifyRestoredTree(ctx context.Context, dst backend.Backend, c Cipher, head
 		for len(frontier) > 0 {
 			nodes := make([]*node, len(frontier))
 			if err := runParallel(ctx, streams, len(frontier), peakG, func(wctx context.Context, idx int) error {
-				n, err := verifyVol.t.sh.load(wctx, frontier[idx])
+				r := frontier[idx]
+				n, err := verifyVol.t.sh.load(wctx, r)
+				if err != nil && errors.Is(err, backend.ErrNotFound) {
+					// A pruned destination shard was concurrently removed by destination GC
+					// between PlanDelta and verifyRestoredTree; recover it from source.
+					sk := shardKey(r)
+					sealed, _, serr := srcCount.Get(wctx, sk, maxShard)
+					if serr != nil {
+						if errors.Is(serr, backend.ErrNotFound) {
+							return fmt.Errorf("%w: source shard %x is missing", ErrSourceCheckpointGCed, r[:6])
+						}
+						return fmt.Errorf("vfs: read source shard %x: %w", r[:6], serr)
+					}
+					if blake3.Sum(sealed) != r {
+						return fmt.Errorf("%w: shard %x does not hash to its name", ErrCorrupt, r[:6])
+					}
+					if _, uerr := unseal(c, shardAAD(head.ID), sealed); uerr != nil {
+						return fmt.Errorf("vfs: open source shard %x: %w", r[:6], uerr)
+					}
+					if _, perr := dstTransferCount.PutIfAbsent(wctx, sk, sealed); perr == nil {
+						shardsCopied.Add(1)
+						bytesTransferred.Add(int64(len(sealed)))
+					} else if !errors.Is(perr, backend.ErrConflict) {
+						return fmt.Errorf("vfs: recover destination shard %s: %w", sk, perr)
+					}
+					n, err = verifyVol.t.sh.load(wctx, r)
+				}
 				if err != nil {
 					return err
 				}
 				if expectedLevel >= 0 && n.level != expectedLevel {
-					return fmt.Errorf("%w: shard %x has level %d, want %d", ErrCorrupt, frontier[idx][:6], n.level, expectedLevel)
+					return fmt.Errorf("%w: shard %x has level %d, want %d", ErrCorrupt, r[:6], n.level, expectedLevel)
 				}
 				nodes[idx] = n
 				return nil
 			}); err != nil {
-				return fmt.Errorf("vfs: verify destination shards: %w", err)
+				return verifyOutcome{}, fmt.Errorf("vfs: verify destination shards: %w", err)
 			}
 			var next []ref
 			levelVal := -1
@@ -831,7 +938,7 @@ func verifyRestoredTree(ctx context.Context, dst backend.Backend, c Cipher, head
 				if levelVal < 0 {
 					levelVal = n.level
 				} else if n.level != levelVal {
-					return fmt.Errorf("%w: destination tree level mismatch (%d vs %d)", ErrCorrupt, n.level, levelVal)
+					return verifyOutcome{}, fmt.Errorf("%w: destination tree level mismatch (%d vs %d)", ErrCorrupt, n.level, levelVal)
 				}
 				if n.level > 0 {
 					for _, v := range n.vals {
@@ -848,9 +955,309 @@ func verifyRestoredTree(ctx context.Context, dst backend.Backend, c Cipher, head
 		}
 	}
 	if err := verifyVol.ns.load(head); err != nil {
-		return fmt.Errorf("vfs: verify head metadata: %w", err)
+		return verifyOutcome{}, fmt.Errorf("vfs: verify head metadata: %w", err)
 	}
-	return verifyVol.checkTree(ctx, true)
+
+	// Collect all chunk table records [tChunk] and all file extent references [tData]
+	// from the restored tree on destination.
+	chunkTable := map[chunkID]where{}
+	needPacks := map[packID]uint64{}
+	if head.Root != none {
+		var bad error
+		if err := verifyVol.t.scan(ctx, verifyVol.root, []byte{tChunk}, func(k, val []byte) bool {
+			if len(k) != 1+len(chunkID{}) {
+				bad = fmt.Errorf("%w: chunk table key of %d bytes", ErrCorrupt, len(k))
+				return false
+			}
+			w, err := decodeWhere(val)
+			if err != nil {
+				bad = err
+				return false
+			}
+			if w.off+w.n < w.off || w.n == 0 {
+				bad = fmt.Errorf("%w: invalid chunk extent off=%d n=%d", ErrCorrupt, w.off, w.n)
+				return false
+			}
+			var cid chunkID
+			copy(cid[:], k[1:])
+			chunkTable[cid] = w
+			needPacks[w.pack] = max(needPacks[w.pack], w.off+w.n)
+			return true
+		}); err != nil {
+			return verifyOutcome{}, err
+		}
+		if bad != nil {
+			return verifyOutcome{}, bad
+		}
+
+		if err := verifyVol.t.scan(ctx, verifyVol.root, []byte{tData}, func(k, val []byte) bool {
+			if len(k) != prefixLen+8 {
+				return true
+			}
+			e, err := decodeExtent(offsetOf(k), val)
+			if err != nil {
+				bad = err
+				return false
+			}
+			if _, ok := chunkTable[e.id]; !ok {
+				bad = fmt.Errorf("%w: chunk %x of a file is in no table", ErrCorrupt, e.id[:6])
+				return false
+			}
+			return true
+		}); err != nil {
+			return verifyOutcome{}, err
+		}
+		if bad != nil {
+			return verifyOutcome{}, bad
+		}
+	}
+
+	// Recover any pruned destination pack that was concurrently deleted by destination GC
+	// between PlanDelta and verifyRestoredTree BEFORE checkTree stats every pack.
+	if len(needPacks) > 0 {
+		packIDs := make([]packID, 0, len(needPacks))
+		for pid := range needPacks {
+			packIDs = append(packIDs, pid)
+		}
+		sort.Slice(packIDs, func(i, j int) bool { return packKey(packIDs[i]) < packKey(packIDs[j]) })
+
+		if err := runParallel(ctx, streams, len(packIDs), peakG, func(wctx context.Context, idx int) error {
+			pid := packIDs[idx]
+			pk := packKey(pid)
+			reqEnd := needPacks[pid]
+			sz, err := dstVerifyCount.Stat(wctx, pk)
+			if errors.Is(err, backend.ErrNotFound) {
+				if rerr := recoverDestinationGCPack(wctx, srcCount, dstTransferCount, pk, pid, reqEnd, packsCopied, bytesTransferred, gcRecoveredPacks); rerr != nil {
+					return rerr
+				}
+				sz, err = dstVerifyCount.Stat(wctx, pk)
+			}
+			if err != nil {
+				if errors.Is(err, backend.ErrNotFound) {
+					return fmt.Errorf("%w: pack %x is missing", ErrCorrupt, pid[:6])
+				}
+				return err
+			}
+			if uint64(sz) < reqEnd {
+				return fmt.Errorf("%w: pack %x has %d bytes and a chunk ends at %d", ErrCorrupt, pid[:6], sz, reqEnd)
+			}
+			return nil
+		}); err != nil {
+			return verifyOutcome{}, err
+		}
+	}
+
+	if err := verifyVol.checkTree(ctx, true); err != nil {
+		return verifyOutcome{}, err
+	}
+
+	if len(chunkTable) == 0 {
+		return verifyOutcome{}, nil
+	}
+
+	byPack := map[packID][]parasyncChunkEntry{}
+	for cid, w := range chunkTable {
+		byPack[w.pack] = append(byPack[w.pack], parasyncChunkEntry{id: w, ch: cid})
+	}
+	packList := make([]packID, 0, len(byPack))
+	for pid, entries := range byPack {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].id.off < entries[j].id.off })
+		byPack[pid] = entries
+		packList = append(packList, pid)
+	}
+	sort.Slice(packList, func(i, j int) bool { return packKey(packList[i]) < packKey(packList[j]) })
+
+	var (
+		chunksVerified   atomic.Int64
+		receiptsVerified atomic.Int64
+	)
+
+	if err := runParallel(ctx, streams, len(packList), peakG, func(wctx context.Context, idx int) error {
+		pid := packList[idx]
+		pk := packKey(pid)
+		entries := byPack[pid]
+		reqEnd := needPacks[pid]
+
+		data, ver, err := dstVerifyCount.Get(wctx, pk, int64(packTarget+packRoom))
+		if errors.Is(err, backend.ErrNotFound) {
+			if rerr := recoverDestinationGCPack(wctx, srcCount, dstTransferCount, pk, pid, reqEnd, packsCopied, bytesTransferred, gcRecoveredPacks); rerr != nil {
+				return rerr
+			}
+			data, ver, err = dstVerifyCount.Get(wctx, pk, int64(packTarget+packRoom))
+		}
+		if err != nil {
+			if errors.Is(err, backend.ErrNotFound) {
+				return fmt.Errorf("%w: pack %x is missing", ErrCorrupt, pid[:6])
+			}
+			return fmt.Errorf("vfs: read destination pack %x: %w", pid[:6], err)
+		}
+		if uint64(len(data)) < reqEnd {
+			return fmt.Errorf("%w: pack %x has %d bytes and a chunk ends at %d", ErrCorrupt, pid[:6], len(data), reqEnd)
+		}
+
+		if opts.TrustSealedReceipt && ver != "" {
+			if checkParaSyncPackReceipt(wctx, dstVerifyCount, c, head, pid, ver, uint64(len(data)), uint64(len(entries))) {
+				receiptsVerified.Add(1)
+				chunksVerified.Add(int64(len(entries)))
+				return nil
+			}
+		}
+
+		for _, ent := range entries {
+			end := ent.id.off + ent.id.n
+			if end < ent.id.off || end > uint64(len(data)) {
+				return fmt.Errorf("%w: pack %x chunk %x extent [%d,%d) out of bounds %d", ErrCorrupt, pid[:6], ent.ch[:6], ent.id.off, end, len(data))
+			}
+			frame := data[ent.id.off:end]
+			plain, uerr := unseal(c, chunkAAD(head.ID, ent.ch), frame)
+			if uerr != nil {
+				return fmt.Errorf("vfs: verify chunk %x in pack %x: %w", ent.ch[:6], pid[:6], uerr)
+			}
+			if sumChunk(plain) != ent.ch {
+				return fmt.Errorf("%w: chunk %x in pack %x does not hash to its id", ErrCorrupt, ent.ch[:6], pid[:6])
+			}
+			chunksVerified.Add(1)
+		}
+
+		if opts.SaveVerifyReceipt && ver != "" {
+			if err := saveParaSyncPackReceipt(wctx, dstTransferCount, c, head, pid, ver, uint64(len(data)), uint64(len(entries))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return verifyOutcome{}, err
+	}
+
+	return verifyOutcome{
+		chunksVerified:   int(chunksVerified.Load()),
+		receiptsVerified: int(receiptsVerified.Load()),
+	}, nil
+}
+
+func recoverDestinationGCPack(
+	ctx context.Context,
+	srcCount *parasyncCountingBackend,
+	dstTransferCount *parasyncCountingBackend,
+	pk string,
+	pid packID,
+	reqEnd uint64,
+	packsCopied *atomic.Int64,
+	bytesTransferred *atomic.Int64,
+	gcRecoveredPacks *atomic.Int64,
+) error {
+	data, _, err := srcCount.Get(ctx, pk, int64(packTarget+packRoom))
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return fmt.Errorf("%w: source pack %x is missing", ErrSourceCheckpointGCed, pid[:6])
+		}
+		return fmt.Errorf("vfs: read source pack %s: %w", pk, err)
+	}
+	if uint64(len(data)) < reqEnd {
+		return fmt.Errorf("%w: source pack %x has %d bytes and a chunk ends at %d", ErrCorrupt, pid[:6], len(data), reqEnd)
+	}
+	_, err = dstTransferCount.PutIfAbsent(ctx, pk, data)
+	switch {
+	case err == nil:
+		packsCopied.Add(1)
+		bytesTransferred.Add(int64(len(data)))
+		gcRecoveredPacks.Add(1)
+		return nil
+	case errors.Is(err, backend.ErrConflict):
+		return nil
+	default:
+		return fmt.Errorf("vfs: recover destination pack %s: %w", pk, err)
+	}
+}
+
+func encodeParaSyncReceipt(pid packID, ver backend.Version, packSize, chunkCount uint64) []byte {
+	var b []byte
+	b = append(b, paraSyncReceiptMagic...)
+	b = append(b, pid[:]...)
+	b = binary.AppendUvarint(b, packSize)
+	b = binary.AppendUvarint(b, chunkCount)
+	b = binary.AppendUvarint(b, uint64(len(ver)))
+	b = append(b, ver...)
+	return b
+}
+
+func checkParaSyncPackReceipt(
+	ctx context.Context,
+	dst backend.Backend,
+	c Cipher,
+	head Head,
+	pid packID,
+	ver backend.Version,
+	packSize uint64,
+	chunkCount uint64,
+) bool {
+	rest := extRest(head.Seed, paraSyncExtName, pid[:])
+	objKey := extObjectKey(paraSyncExtName, rest)
+	sealed, _, err := dst.Get(ctx, objKey, maxExtSealed)
+	if err != nil {
+		return false
+	}
+	plain, err := unseal(c, extAAD(head.ID, paraSyncExtName, rest), sealed)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(plain, encodeParaSyncReceipt(pid, ver, packSize, chunkCount))
+}
+
+func saveParaSyncPackReceipt(
+	ctx context.Context,
+	dst backend.Backend,
+	c Cipher,
+	head Head,
+	pid packID,
+	ver backend.Version,
+	packSize uint64,
+	chunkCount uint64,
+) error {
+	rest := extRest(head.Seed, paraSyncExtName, pid[:])
+	objKey := extObjectKey(paraSyncExtName, rest)
+	plain := encodeParaSyncReceipt(pid, ver, packSize, chunkCount)
+	sealed, err := seal(c, extAAD(head.ID, paraSyncExtName, rest), plain)
+	if err != nil {
+		return err
+	}
+	for range extReplace {
+		_, err = dst.PutIfAbsent(ctx, objKey, sealed)
+		if err == nil || !errors.Is(err, backend.ErrConflict) {
+			return err
+		}
+		_, curVer, gerr := dst.Get(ctx, objKey, maxExtSealed)
+		if errors.Is(gerr, backend.ErrNotFound) {
+			continue
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if _, err = dst.PutIfVersion(ctx, objKey, sealed, curVer); err == nil || !errors.Is(err, backend.ErrConflict) {
+			return err
+		}
+	}
+	return fmt.Errorf("vfs: save parasync verify receipt: %w", err)
+}
+
+func parasyncHeadLanded(ctx context.Context, dstFence *fence.Store, place string, c Cipher, want Head, round uint64) bool {
+	payload, recorded, err := dstFence.Get(ctx, headKey)
+	if err != nil || recorded < round {
+		return false
+	}
+	plain, err := unseal(c, headAAD(place), payload)
+	if err != nil {
+		return false
+	}
+	cur, err := unmarshalHead(plain)
+	return err == nil &&
+		cur.ID == want.ID &&
+		cur.Root == want.Root &&
+		cur.Seq == want.Seq &&
+		cur.Journal == want.Journal &&
+		cur.Next == want.Next &&
+		cur.Needs == want.Needs &&
+		cur.Tail == want.Tail
 }
 
 func runParallel(ctx context.Context, workers, n int, peakG *atomic.Int64, fn func(context.Context, int) error) error {

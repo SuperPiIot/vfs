@@ -513,6 +513,352 @@ func testHeadAAD(place string) []byte {
 	return h.Sum(nil)
 }
 
+func TestParaSyncSameLengthCorruptResidentPackRejected(t *testing.T) {
+	srcMem := storetest.NewMem()
+	dstMem := storetest.NewMem()
+	c := vfsAge(t)
+
+	if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+		t.Fatal(err)
+	}
+	srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcVol.Close()
+
+	stateOne(t, srcVol)
+	write(t, srcVol, vfs.RootInode, "pack-resident.bin", content(4242, 1200_000))
+	flush(t, srcVol)
+	snap1 := snapshot(t, reopen(t, srcMem, c))
+
+	stats1, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 1, Streams: 4})
+	if err != nil {
+		t.Fatalf("initial restore: %v", err)
+	}
+	if stats1.ChunksVerified == 0 || stats1.VerifyBytesRead <= 0 || stats1.VerifyGets <= 0 {
+		t.Fatalf("expected non-zero chunk verification metrics on initial restore, got chunks=%d bytes=%d gets=%d",
+			stats1.ChunksVerified, stats1.VerifyBytesRead, stats1.VerifyGets)
+	}
+
+	// Find a resident pack/... object on dst and flip 1 byte while keeping the exact byte length.
+	var residentPackKey string
+	for k, v := range dstMem.Dump() {
+		if strings.HasPrefix(k, "pack/") {
+			residentPackKey = k
+			corrupted := bytes.Clone(v)
+			corrupted[len(corrupted)/2] ^= 0xff
+			if len(corrupted) != len(v) {
+				t.Fatal("byte length changed")
+			}
+			if err := dstMem.Put(ctx, k, corrupted); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if residentPackKey == "" {
+		t.Fatal("expected at least one resident pack on destination")
+	}
+
+	// Mutate src to checkpoint 2 while keeping pack-resident.bin live so PlanDelta prunes residentPackKey.
+	stateTwo(t, srcVol)
+	write(t, srcVol, vfs.RootInode, "pack-delta2.bin", content(5353, 1200_000))
+	flush(t, srcVol)
+
+	plan2, err := vfs.PlanDelta(ctx, srcMem, dstMem, c)
+	if err != nil {
+		t.Fatalf("PlanDelta with same-length corrupt resident pack: %v", err)
+	}
+	if plan2.PacksPruned == 0 {
+		t.Fatalf("expected resident pack %s to be pruned by Stat length in PlanDelta", residentPackKey)
+	}
+
+	// Record dst head before RestoreDelta: RestoreDelta MUST fail closed with ErrCorrupt
+	// during chunk verification BEFORE advancing dst head.
+	headBefore, verBefore, err := dstMem.Get(ctx, "head", backend.Unbounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 2, Streams: 4}); !errors.Is(err, vfs.ErrCorrupt) {
+		t.Fatalf("RestoreDelta with same-length bit-flipped resident pack = %v, want ErrCorrupt", err)
+	}
+	headAfter, verAfter, err := dstMem.Get(ctx, "head", backend.Unbounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verAfter != verBefore || !bytes.Equal(headAfter, headBefore) {
+		t.Fatalf("destination head changed despite corrupt resident pack (ver %q -> %q)", verBefore, verAfter)
+	}
+	_ = snap1
+}
+
+func TestParaSyncSameLengthConflictingPackSubstitutionRejected(t *testing.T) {
+	srcMem := storetest.NewMem()
+	dstMem := storetest.NewMem()
+	c := vfsAge(t)
+
+	if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+		t.Fatal(err)
+	}
+	srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcVol.Close()
+
+	stateOne(t, srcVol)
+	flush(t, srcVol)
+	snap1 := snapshot(t, reopen(t, srcMem, c))
+
+	if _, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 1, Streams: 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Advance src to checkpoint 2 with a new packed file.
+	stateTwo(t, srcVol)
+	write(t, srcVol, vfs.RootInode, "pack-new.bin", content(7777, 1200_000))
+	flush(t, srcVol)
+
+	plan, err := vfs.PlanDelta(ctx, srcMem, dstMem, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.PacksToCopy) == 0 {
+		t.Fatal("expected at least one new pack in PacksToCopy")
+	}
+	targetPack := plan.PacksToCopy[0]
+	rawPack, _, err := srcMem.Get(ctx, targetPack, backend.Unbounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject a same-length substituted/bit-flipped pack on dst right when RestoreDelta
+	// attempts PutIfAbsent(targetPack), triggering ErrConflict with matching Stat length.
+	bogusPack := bytes.Clone(rawPack)
+	bogusPack[len(bogusPack)/3] ^= 0xa5
+	hookDst := &storetest.Hook{
+		Backend: dstMem,
+		Before: func(op, key string) error {
+			if op == "putabsent" && key == targetPack {
+				return dstMem.Put(ctx, targetPack, bogusPack)
+			}
+			return nil
+		},
+	}
+
+	if _, err := vfs.RestoreDelta(ctx, srcMem, hookDst, c, vfs.RestoreOptions{Round: 2, Streams: 4}); !errors.Is(err, vfs.ErrCorrupt) {
+		t.Fatalf("RestoreDelta with same-length conflicting pack substitution = %v, want ErrCorrupt", err)
+	}
+	// Destination head must remain untouched at checkpoint 1.
+	sameSnapshot(t, "dst untouched after conflicting pack substitution", snapshot(t, reopen(t, dstMem, c)), snap1)
+}
+
+func TestParaSyncLostHeadACKAndGCRaces(t *testing.T) {
+	c := vfsAge(t)
+
+	// (a) Lost Head ACK on PutIfVersion/PutIfAbsent ("head"): write landed on dst,
+	// After hook returns simulated network error, RestoreDelta inspects dst head,
+	// recognizes our commit landed, sets LostHeadACKRecovered=true, and returns nil.
+	t.Run("lost_head_ack_recovered", func(t *testing.T) {
+		srcMem := storetest.NewMem()
+		dstMem := storetest.NewMem()
+		if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+			t.Fatal(err)
+		}
+		srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srcVol.Close()
+
+		stateOne(t, srcVol)
+		flush(t, srcVol)
+		if _, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 1, Streams: 4}); err != nil {
+			t.Fatal(err)
+		}
+
+		stateTwo(t, srcVol)
+		write(t, srcVol, vfs.RootInode, "pack-ack.bin", content(31415, 1100_000))
+		flush(t, srcVol)
+		snap2 := snapshot(t, reopen(t, srcMem, c))
+
+		lostACK := errors.New("simulated lost HTTP 200 ACK after head CAS")
+		var injected atomic.Bool
+		ackHook := &storetest.Hook{
+			Backend: dstMem,
+			After: func(op, key string) error {
+				if (op == "putver" || op == "putabsent") && key == "head" && injected.CompareAndSwap(false, true) {
+					return lostACK
+				}
+				return nil
+			},
+		}
+
+		stats, err := vfs.RestoreDelta(ctx, srcMem, ackHook, c, vfs.RestoreOptions{Round: 2, Streams: 4})
+		if err != nil {
+			t.Fatalf("RestoreDelta should recover lost head ACK, got err: %v", err)
+		}
+		if !injected.Load() || !stats.LostHeadACKRecovered {
+			t.Fatalf("expected LostHeadACKRecovered=true (injected=%v, stat=%v)", injected.Load(), stats.LostHeadACKRecovered)
+		}
+		sameSnapshot(t, "dst after lost head ACK recovery", snapshot(t, reopen(t, dstMem, c)), snap2)
+	})
+
+	// (b) Concurrent destination GC deleting a pruned pack (and pruned shard) after PlanDelta
+	// Stat/prune decision: verifyRestoredTree re-fetches the missing object from src,
+	// cryptographically verifies all chunks, and completes the restore cleanly.
+	t.Run("concurrent_dest_gc_pruned_pack_recovered", func(t *testing.T) {
+		srcMem := storetest.NewMem()
+		dstMem := storetest.NewMem()
+		if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+			t.Fatal(err)
+		}
+		srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srcVol.Close()
+
+		stateOne(t, srcVol)
+		write(t, srcVol, vfs.RootInode, "pruned-pack.bin", content(6161, 1200_000))
+		flush(t, srcVol)
+
+		if _, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 1, Streams: 4}); err != nil {
+			t.Fatal(err)
+		}
+
+		var prunedPackKey string
+		for k := range dstMem.Dump() {
+			if strings.HasPrefix(k, "pack/") {
+				prunedPackKey = k
+				break
+			}
+		}
+		if prunedPackKey == "" {
+			t.Fatal("expected resident pack on dst")
+		}
+
+		stateTwo(t, srcVol)
+		write(t, srcVol, vfs.RootInode, "new-pack.bin", content(6262, 1200_000))
+		flush(t, srcVol)
+		snap2 := snapshot(t, reopen(t, srcMem, c))
+
+		// When RestoreDelta writes the new pack to dst (after PlanDelta has already pruned
+		// prunedPackKey), simulate concurrent destination GC deleting prunedPackKey.
+		var gcFired atomic.Bool
+		gcHook := &storetest.Hook{
+			Backend: dstMem,
+			After: func(op, key string) error {
+				if op == "putabsent" && strings.HasPrefix(key, "pack/") && key != prunedPackKey && gcFired.CompareAndSwap(false, true) {
+					return dstMem.Delete(ctx, prunedPackKey)
+				}
+				return nil
+			},
+		}
+
+		stats, err := vfs.RestoreDelta(ctx, srcMem, gcHook, c, vfs.RestoreOptions{Round: 2, Streams: 4})
+		if err != nil {
+			t.Fatalf("RestoreDelta after concurrent destination GC of pruned pack: %v", err)
+		}
+		if !gcFired.Load() || stats.DestGCRecoveredPacks != 1 {
+			t.Fatalf("expected 1 recovered destination GC pack (gcFired=%v, recovered=%d)", gcFired.Load(), stats.DestGCRecoveredPacks)
+		}
+		sameSnapshot(t, "dst after destination GC recovery", snapshot(t, reopen(t, dstMem, c)), snap2)
+	})
+
+	// (c) Concurrent source GC deleting a planned pack on src before transfer:
+	// returns ErrSourceCheckpointGCed (wrapping backend.ErrNotFound) and leaves dst at checkpoint 1.
+	t.Run("concurrent_source_gc_returns_ErrSourceCheckpointGCed", func(t *testing.T) {
+		srcMem := storetest.NewMem()
+		dstMem := storetest.NewMem()
+		if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+			t.Fatal(err)
+		}
+		srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srcVol.Close()
+
+		stateOne(t, srcVol)
+		flush(t, srcVol)
+		snap1 := snapshot(t, reopen(t, srcMem, c))
+
+		if _, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 1, Streams: 4}); err != nil {
+			t.Fatal(err)
+		}
+
+		stateTwo(t, srcVol)
+		write(t, srcVol, vfs.RootInode, "src-gc-pack.bin", content(9191, 1200_000))
+		flush(t, srcVol)
+
+		plan, err := vfs.PlanDelta(ctx, srcMem, dstMem, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.PacksToCopy) == 0 {
+			t.Fatal("expected planned pack on source")
+		}
+		// Delete planned pack from source to simulate concurrent source checkpoint GC.
+		if err := srcMem.Delete(ctx, plan.PacksToCopy[0]); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{Round: 2, Streams: 4})
+		if !errors.Is(err, vfs.ErrSourceCheckpointGCed) || !errors.Is(err, backend.ErrNotFound) {
+			t.Fatalf("RestoreDelta after source GC = %v, want ErrSourceCheckpointGCed & backend.ErrNotFound", err)
+		}
+		sameSnapshot(t, "dst untouched after source GC race", snapshot(t, reopen(t, dstMem, c)), snap1)
+	})
+
+	// (d) Optional Cipher-sealed integrity receipt (SaveVerifyReceipt / TrustSealedReceipt).
+	t.Run("sealed_verify_receipt_opt_in", func(t *testing.T) {
+		srcMem := storetest.NewMem()
+		dstMem := storetest.NewMem()
+		if err := vfs.Create(ctx, cfg(srcMem, c, 0)); err != nil {
+			t.Fatal(err)
+		}
+		srcVol, err := vfs.Attach(ctx, cfg(srcMem, c, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srcVol.Close()
+
+		stateOne(t, srcVol)
+		write(t, srcVol, vfs.RootInode, "receipt-pack.bin", content(1234, 1200_000))
+		flush(t, srcVol)
+
+		st1, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{
+			Round:             1,
+			Streams:           4,
+			SaveVerifyReceipt: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st1.ChunksVerified == 0 || st1.ReceiptsVerified != 0 {
+			t.Fatalf("unexpected initial receipt stats: chunks=%d receipts=%d", st1.ChunksVerified, st1.ReceiptsVerified)
+		}
+
+		// Subsequent delta restore with TrustSealedReceipt=true reuses the sealed receipt
+		// when pack version & size match, while default TrustSealedReceipt=false re-verifies chunks.
+		stateTwo(t, srcVol)
+		flush(t, srcVol)
+		st2, err := vfs.RestoreDelta(ctx, srcMem, dstMem, c, vfs.RestoreOptions{
+			Round:              2,
+			Streams:            4,
+			TrustSealedReceipt: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st2.ReceiptsVerified == 0 {
+			t.Fatalf("expected ReceiptsVerified > 0 with TrustSealedReceipt=true, got %d", st2.ReceiptsVerified)
+		}
+	})
+}
+
 func TestParaSyncMatchedBaselineAndRealS3(t *testing.T) {
 	runCase := func(t *testing.T, name string, mkBE func(prefix string) backend.Backend, reqCount func() int) {
 		t.Run(name, func(t *testing.T) {
@@ -586,9 +932,9 @@ func TestParaSyncMatchedBaselineAndRealS3(t *testing.T) {
 				sameSnapshot(t, "inline full", snapshot(t, reopen(t, dstFullBE, c)), wantSnap)
 				sameSnapshot(t, "inline delta", snapshot(t, reopen(t, dstDeltaBE, c)), wantSnap)
 
-				t.Logf("inline matched Streams=4: full(dur=%v cpu=%v bytes=%d gets=%d reqs=%d) vs delta(dur=%v cpu=%v bytes=%d gets=%d pruned=%d/%d reqs=%d)",
-					fullStats.Duration, fullStats.CPUTime, fullStats.BytesTransferred, fullStats.SourceGets, fullReqs,
-					deltaStats.Duration, deltaStats.CPUTime, deltaStats.BytesTransferred, deltaStats.SourceGets,
+				t.Logf("inline matched Streams=4: full(dur=%v cpu=%v bytes=%d verifyBytes=%d verifyGets=%d chunksVer=%d gets=%d reqs=%d) vs delta(dur=%v cpu=%v bytes=%d verifyBytes=%d verifyGets=%d chunksVer=%d gets=%d pruned=%d/%d reqs=%d)",
+					fullStats.Duration, fullStats.CPUTime, fullStats.BytesTransferred, fullStats.VerifyBytesRead, fullStats.VerifyGets, fullStats.ChunksVerified, fullStats.SourceGets, fullReqs,
+					deltaStats.Duration, deltaStats.CPUTime, deltaStats.BytesTransferred, deltaStats.VerifyBytesRead, deltaStats.VerifyGets, deltaStats.ChunksVerified, deltaStats.SourceGets,
 					deltaStats.Plan.ShardsPruned, deltaStats.Plan.TotalSourceShards, deltaReqs)
 
 				if deltaStats.BytesTransferred >= fullStats.BytesTransferred {
@@ -647,9 +993,9 @@ func TestParaSyncMatchedBaselineAndRealS3(t *testing.T) {
 				sameSnapshot(t, "packed full", snapshot(t, reopen(t, dstFullBE, c)), wantSnap)
 				sameSnapshot(t, "packed delta", snapshot(t, reopen(t, dstDeltaBE, c)), wantSnap)
 
-				t.Logf("packed matched Streams=4: full(dur=%v cpu=%v bytes=%d packs=%d gets=%d reqs=%d) vs delta(dur=%v cpu=%v bytes=%d packs=%d prunedPacks=%d/%d gets=%d reqs=%d)",
-					fullStats.Duration, fullStats.CPUTime, fullStats.BytesTransferred, fullStats.PacksCopied, fullStats.SourceGets, fullReqs,
-					deltaStats.Duration, deltaStats.CPUTime, deltaStats.BytesTransferred, deltaStats.PacksCopied,
+				t.Logf("packed matched Streams=4: full(dur=%v cpu=%v bytes=%d verifyBytes=%d verifyGets=%d chunksVer=%d packs=%d gets=%d reqs=%d) vs delta(dur=%v cpu=%v bytes=%d verifyBytes=%d verifyGets=%d chunksVer=%d packs=%d prunedPacks=%d/%d gets=%d reqs=%d)",
+					fullStats.Duration, fullStats.CPUTime, fullStats.BytesTransferred, fullStats.VerifyBytesRead, fullStats.VerifyGets, fullStats.ChunksVerified, fullStats.PacksCopied, fullStats.SourceGets, fullReqs,
+					deltaStats.Duration, deltaStats.CPUTime, deltaStats.BytesTransferred, deltaStats.VerifyBytesRead, deltaStats.VerifyGets, deltaStats.ChunksVerified, deltaStats.PacksCopied,
 					deltaStats.Plan.PacksPruned, deltaStats.Plan.TotalSourcePacks, deltaStats.SourceGets, deltaReqs)
 
 				if deltaStats.PacksCopied != 1 || deltaStats.Plan.PacksPruned != nPacks {
